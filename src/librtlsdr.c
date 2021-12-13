@@ -105,6 +105,8 @@ typedef int socklen_t;
 #define ENBALE_R820T_HARM_OPT	1
 #define ENABLE_VCO_OPTIONS		1
 
+#define ENABLE_ZEROCOPY 0
+
 
 /* activate/use RTL's IF AGC control .. from  https://github.com/old-dab/rtlsdr
  * purpose: make AGC more smooth .. and NOT freeze
@@ -3851,7 +3853,7 @@ static int _rtlsdr_alloc_async_buffers(rtlsdr_dev_t *dev)
 	dev->xfer_buf = malloc(dev->xfer_buf_num * sizeof(unsigned char *));
 	memset(dev->xfer_buf, 0, dev->xfer_buf_num * sizeof(unsigned char *));
 
-#if defined (__linux__) && LIBUSB_API_VERSION >= 0x01000105
+#if defined (__linux__) && LIBUSB_API_VERSION >= 0x01000105 && ENABLE_ZEROCOPY
 	fprintf(stderr, "Allocating %d zero-copy buffers\n", dev->xfer_buf_num);
 
 	dev->use_zerocopy = 1;
@@ -3916,7 +3918,7 @@ static int _rtlsdr_free_async_buffers(rtlsdr_dev_t *dev)
 		for (i = 0; i < dev->xfer_buf_num; ++i) {
 			if (dev->xfer_buf[i]) {
 				if (dev->use_zerocopy) {
-#if defined (__linux__) && LIBUSB_API_VERSION >= 0x01000105
+#if defined (__linux__) && LIBUSB_API_VERSION >= 0x01000105 && ENABLE_ZEROCOPY
 					libusb_dev_mem_free(dev->devh,
 							    dev->xfer_buf[i],
 							    dev->xfer_buf_len);
