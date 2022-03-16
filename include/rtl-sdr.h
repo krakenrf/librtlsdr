@@ -698,6 +698,16 @@ RTLSDR_API int rtlsdr_set_tuner_i2c_override(rtlsdr_dev_t *dev, unsigned i2c_reg
 
 
 /*!
+ * Set the sample rate correction value for the device.
+ *
+ * \param dev the device handle given by rtlsdr_open()
+ * \param correction sample rate correction as fraction of the sample rate
+ * \return 0 on success. From tejeez branch https://github.com/tejeez/rtl-sdr/blob/master/include/rtl-sdr.h
+ */
+RTLSDR_API int rtlsdr_set_sample_freq_correction_f(rtlsdr_dev_t *dev, float correction);
+
+
+/*!
  * request version id string to identify source and date of library
  *
  * \return pointer to C string, e.g. "github.com/librtlsdr" or "github.com/hayguen" or .. with build date (in parantheses)
