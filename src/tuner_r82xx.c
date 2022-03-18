@@ -1729,7 +1729,6 @@ static const int r82xx_if[]  =    { 1700, 1650, 1600, 1500, 1400, 1350, 1320, 12
 
 static const int r82xx_bw_tablen = sizeof(IFi) / sizeof(IFi[0]);
 
-
 #define FILT_HP_BW1 350000
 #define FILT_HP_BW2 380000
 int r82xx_set_bandwidth(struct r82xx_priv *priv, int bw, uint32_t rate, uint32_t * applied_bw, int apply)
@@ -1775,10 +1774,13 @@ int r82xx_set_bandwidth(struct r82xx_priv *priv, int bw, uint32_t rate, uint32_t
 				break;
 		}
 
-		reg_0a = IFi[i].reg10Lo;
-		reg_0b = IFi[i].reg11;
-		reg_1e = IFi[i].reg30Hi;
+                // CARL: We need to disable this filter, as it causes phase distortion
+		reg_0a = 0x00; //IFi[i].reg10Lo; //0x0F;
+		reg_0b = 0x8F; //IFi[i].reg11; //0xE7;
+		reg_1e = IFi[i].reg30Hi; //0x00;
 		real_bw = IFi[i].bw * 1000;   /* kHz part */
+
+
 #if 0
 		fprintf(stderr, "%s: selected idx %d: R10 = %02X, R11 = %02X, Bw %d, IF %d\n"
 			, __FUNCTION__, i
