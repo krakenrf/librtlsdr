@@ -1262,7 +1262,7 @@ int rtlsdr_set_sample_freq_correction_f(rtlsdr_dev_t *dev, float correction)
 	if(offs1 > 0x1FFF) offs = 0x1FFF;
 	else if(offs1 < -0x1FFF) offs = -0x1FFF;
 	else offs = offs1;
-	rtlsdr_set_i2c_repeater(dev, 0);
+	//rtlsdr_set_i2c_repeater(dev, 0);
 
 	tmp = offs & 0xff;
 	r |= rtlsdr_demod_write_reg(dev, 1, 0x3f, tmp, 1);
