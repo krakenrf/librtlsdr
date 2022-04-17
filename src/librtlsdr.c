@@ -964,6 +964,7 @@ int rtlsdr_demod_write_reg(rtlsdr_dev_t *dev, uint8_t page, uint16_t addr, uint1
 	return (r == len) ? 0 : -1;
 }
 
+
 int rtlsdr_set_gpio_bit(rtlsdr_dev_t *dev, uint8_t gpio, int val)
 {
 	uint16_t r, retval;
@@ -1163,6 +1164,11 @@ void rtlsdr_init_baseband(rtlsdr_dev_t *dev)
 
 	/* disable 4.096 MHz clock output on pin TP_CK0 */
 	rtlsdr_demod_write_reg(dev, 0, 0x0d, 0x83, 1);
+
+        //CARL
+	rtlsdr_demod_write_reg(dev, 1, 0x3e, 0, 1);
+
+
 }
 
 int rtlsdr_deinit_baseband(rtlsdr_dev_t *dev)
@@ -1258,16 +1264,17 @@ int rtlsdr_set_sample_freq_correction_f(rtlsdr_dev_t *dev, float correction)
 	int r = 0;
 	uint8_t tmp;
 	int16_t offs;
-	int32_t offs1 = (int16_t)(correction * -1 * TWO_POW(24));
+	int32_t offs1 = (correction * -1 * TWO_POW(24));
 	if(offs1 > 0x1FFF) offs = 0x1FFF;
 	else if(offs1 < -0x1FFF) offs = -0x1FFF;
 	else offs = offs1;
 	//rtlsdr_set_i2c_repeater(dev, 0);
 
-	tmp = offs & 0xff;
-	r |= rtlsdr_demod_write_reg(dev, 1, 0x3f, tmp, 1);
-	tmp = (offs >> 8) & 0x3f;
-	r |= rtlsdr_demod_write_reg(dev, 1, 0x3e, tmp, 1);
+        tmp = offs & 0xff;
+        r |= rtlsdr_demod_write_reg(dev, 1, 0x3f, tmp, 1);
+        tmp = (offs >> 8) & 0x3f;
+        r |= rtlsdr_demod_write_reg(dev, 1, 0x3e, tmp, 1);
+
 
 	return r;
 }
