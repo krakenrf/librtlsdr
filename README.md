@@ -3,7 +3,7 @@
 
 # Description
 
-Modified version of librtlsdr forKkrakenSDR devices
+Modified version of librtlsdr for KrakenSDR devices
 
 # Build / Install (on debian/ubuntu)
 
