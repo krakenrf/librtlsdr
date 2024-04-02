@@ -436,7 +436,7 @@ static const struct r82xx_freq_range freq_ranges[] = {
 	}, {
 	/* .freq = */			100,	/* Start freq, in MHz */
 	/* .open_d = */			0x00,	/* high */
-	/* .rf_mux_ploy = */	0x02,	/* R26[7:6]=0 (LPF)  R26[1:0]=2 (low) */
+	/* .rf_mux_ploy = */	0x01,	/* R26[7:6]=0 (LPF)  R26[1:0]=1 (middle) */
 	/* .tf_c = */			0x34,	/* R27[7:0]  band12,band11 */
 	/* .xtal_cap20p = */	0x01,	/* R16[1:0]  10pF (01)    */
 	/* .xtal_cap10p = */	0x01,
@@ -444,7 +444,7 @@ static const struct r82xx_freq_range freq_ranges[] = {
 	}, {
 	/* .freq = */			110,	/* Start freq, in MHz */
 	/* .open_d = */			0x00,	/* high */
-	/* .rf_mux_ploy = */	0x02,	/* R26[7:6]=0 (LPF)  R26[1:0]=2 (low) */
+	/* .rf_mux_ploy = */	0x01,	/* R26[7:6]=0 (LPF)  R26[1:0]=1 (middle) */
 	/* .tf_c = */			0x24,	/* R27[7:0]  band13,band11 */
 	/* .xtal_cap20p = */	0x01,	/* R16[1:0]  10pF (01)   */
 	/* .xtal_cap10p = */	0x01,
@@ -452,7 +452,7 @@ static const struct r82xx_freq_range freq_ranges[] = {
 	}, {
 	/* .freq = */			120,	/* Start freq, in MHz */
 	/* .open_d = */			0x00,	/* high */
-	/* .rf_mux_ploy = */	0x02,	/* R26[7:6]=0 (LPF)  R26[1:0]=2 (low) */
+	/* .rf_mux_ploy = */	0x01,	/* R26[7:6]=0 (LPF)  R26[1:0]=1 (middle) */
 	/* .tf_c = */			0x24,	/* R27[7:0]  band13,band11 */
 	/* .xtal_cap20p = */	0x01,	/* R16[1:0]  10pF (01)   */
 	/* .xtal_cap10p = */	0x01,
@@ -460,7 +460,7 @@ static const struct r82xx_freq_range freq_ranges[] = {
 	}, {
 	/* .freq = */			140,	/* Start freq, in MHz */
 	/* .open_d = */			0x00,	/* high */
-	/* .rf_mux_ploy = */	0x02,	/* R26[7:6]=0 (LPF)  R26[1:0]=2 (low) */
+	/* .rf_mux_ploy = */	0x01,	/* R26[7:6]=0 (LPF)  R26[1:0]=1 (middle) */
 	/* .tf_c = */			0x14,	/* R27[7:0]  band14,band11 */
 	/* .xtal_cap20p = */	0x01,	/* R16[1:0]  10pF (01)   */
 	/* .xtal_cap10p = */	0x01,
@@ -468,7 +468,7 @@ static const struct r82xx_freq_range freq_ranges[] = {
 	}, {
 	/* .freq = */			180,	/* Start freq, in MHz */
 	/* .open_d = */			0x00,	/* high */
-	/* .rf_mux_ploy = */	0x02,	/* R26[7:6]=0 (LPF)  R26[1:0]=2 (low) */
+	/* .rf_mux_ploy = */	0x00,	/* R26[7:6]=0 (LPF)  R26[1:0]=0 (highest) */
 	/* .tf_c = */			0x13,	/* R27[7:0]  band14,band12 */
 	/* .xtal_cap20p = */	0x00,	/* R16[1:0]  0pF (00)   */
 	/* .xtal_cap10p = */	0x00,
@@ -476,7 +476,7 @@ static const struct r82xx_freq_range freq_ranges[] = {
 	}, {
 	/* .freq = */			220,	/* Start freq, in MHz */
 	/* .open_d = */			0x00,	/* high */
-	/* .rf_mux_ploy = */	0x02,	/* R26[7:6]=0 (LPF)  R26[1:0]=2 (low) */
+	/* .rf_mux_ploy = */	0x00,	/* R26[7:6]=0 (LPF)  R26[1:0]=0 (highest) */
 	/* .tf_c = */			0x13,	/* R27[7:0]  band14,band12 */
 	/* .xtal_cap20p = */	0x00,	/* R16[1:0]  0pF (00)   */
 	/* .xtal_cap10p = */	0x00,
@@ -484,7 +484,7 @@ static const struct r82xx_freq_range freq_ranges[] = {
 	}, {
 	/* .freq = */			250,	/* Start freq, in MHz */
 	/* .open_d = */			0x00,	/* high */
-	/* .rf_mux_ploy = */	0x02,	/* R26[7:6]=0 (LPF)  R26[1:0]=2 (low) */
+	/* .rf_mux_ploy = */	0x00,	/* R26[7:6]=0 (LPF)  R26[1:0]=0 (highest) */
 	/* .tf_c = */			0x11,	/* R27[7:0]  highest,highest */
 	/* .xtal_cap20p = */	0x00,	/* R16[1:0]  0pF (00)   */
 	/* .xtal_cap10p = */	0x00,
@@ -492,7 +492,7 @@ static const struct r82xx_freq_range freq_ranges[] = {
 	}, {
 	/* .freq = */			280,	/* Start freq, in MHz */
 	/* .open_d = */			0x00,	/* high */
-	/* .rf_mux_ploy = */	0x02,	/* R26[7:6]=0 (LPF)  R26[1:0]=2 (low) */
+	/* .rf_mux_ploy = */	0x00,	/* R26[7:6]=0 (LPF)  R26[1:0]=0 (highest) */
 	/* .tf_c = */			0x00,	/* R27[7:0]  highest,highest */
 	/* .xtal_cap20p = */	0x00,	/* R16[1:0]  0pF (00)   */
 	/* .xtal_cap10p = */	0x00,
@@ -500,7 +500,7 @@ static const struct r82xx_freq_range freq_ranges[] = {
 	}, {
 	/* .freq = */			310,	/* Start freq, in MHz */
 	/* .open_d = */			0x00,	/* high */
-	/* .rf_mux_ploy = */	0x41,	/* R26[7:6]=1 (bypass)  R26[1:0]=1 (middle) */
+	/* .rf_mux_ploy = */	0x40,	/* R26[7:6]=1 (bypass)  R26[1:0]=0 (highest) */
 	/* .tf_c = */			0x00,	/* R27[7:0]  highest,highest */
 	/* .xtal_cap20p = */	0x00,	/* R16[1:0]  0pF (00)   */
 	/* .xtal_cap10p = */	0x00,
@@ -508,7 +508,7 @@ static const struct r82xx_freq_range freq_ranges[] = {
 	}, {
 	/* .freq = */			450,	/* Start freq, in MHz */
 	/* .open_d = */			0x00,	/* high */
-	/* .rf_mux_ploy = */	0x41,	/* R26[7:6]=1 (bypass)  R26[1:0]=1 (middle) */
+	/* .rf_mux_ploy = */	0x40,	/* R26[7:6]=1 (bypass)  R26[1:0]=0 (highest) */
 	/* .tf_c = */			0x00,	/* R27[7:0]  highest,highest */
 	/* .xtal_cap20p = */	0x00,	/* R16[1:0]  0pF (00)   */
 	/* .xtal_cap10p = */	0x00,
