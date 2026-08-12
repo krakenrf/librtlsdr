@@ -1,5 +1,5 @@
+cmake_minimum_required(VERSION 3.10)
 project(rtlsdr)
-cmake_minimum_required(VERSION 2.8)
 
 # created and tested with
 # Qt 5.6.1 for Windows 32-bit (MinGW 4.9.2) from

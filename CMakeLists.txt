@@ -21,11 +21,8 @@
 ########################################################################
 # Project setup
 ########################################################################
-cmake_minimum_required(VERSION 2.6)
+cmake_minimum_required(VERSION 3.10)
 project(rtlsdr C)
-
-# quite old cmake version - probably for compatibility with old OS versions?
-# see https://cmake.org/cmake/help/cmake2.6docs.html
 
 
 #select the release build type by default to get optimization flags
