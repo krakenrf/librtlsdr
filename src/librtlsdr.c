@@ -50,6 +50,32 @@ typedef int socklen_t;
 #endif
 
 #include <libusb.h>
+
+#ifdef _WIN32
+/* Windows: while the bulk transfers stream, an RTL2832U on WinUSB stalls
+ * (LIBUSB_ERROR_PIPE) every control OUT after a quiet spell - every
+ * register write of heimdall's lag servo failed - until a control IN has
+ * been made: repeating the OUT fails for as long as one tries (measured:
+ * 50 tries over 250 ms), one read in between and it goes through. So a
+ * stalled OUT is retried after the dummy demod read librtlsdr already does
+ * after each demod write (page 0x0a, register 0x01). Register reads and
+ * writes are idempotent. Every control transfer of this file comes here. */
+static int rtlsdr_ctrl_transfer_retry(libusb_device_handle *devh, uint8_t request_type,
+	uint8_t request, uint16_t value, uint16_t index, unsigned char *data, uint16_t length,
+	unsigned int timeout)
+{
+	int r = libusb_control_transfer(devh, request_type, request, value, index, data, length, timeout);
+	int i;
+	for (i = 0; i < 3 && r == LIBUSB_ERROR_PIPE && !(request_type & LIBUSB_ENDPOINT_IN); i++) {
+		unsigned char dummy[2];
+		libusb_control_transfer(devh, LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_IN, 0,
+			(0x01 << 8) | 0x20, 0x0a, dummy, 1, timeout);
+		r = libusb_control_transfer(devh, request_type, request, value, index, data, length, timeout);
+	}
+	return r;
+}
+#define libusb_control_transfer rtlsdr_ctrl_transfer_retry
+#endif
 #ifndef WIN32
 #include "rtlsdr_rpc.h"
 #endif
@@ -278,6 +304,9 @@ struct rtlsdr_dev {
 	int dev_lost;
 	int driver_active;
 	unsigned int xfer_errors;
+#ifdef _WIN32
+	int xfer_inflight; /* submitted, callback not run yet (Windows cancel path) */
+#endif
 	int i2c_repeater_on;
 	int rc_active;
 	int verbose;
@@ -3816,6 +3845,9 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
 {
 	rtlsdr_dev_t *dev = (rtlsdr_dev_t *)xfer->user_data;
 
+#ifdef _WIN32
+	dev->xfer_inflight--;
+#endif
 	if (LIBUSB_TRANSFER_COMPLETED == xfer->status) {
 		int keepBlock = 1;
 		if ( dev->softagc.agcState != SOFTSTATE_OFF )
@@ -3824,7 +3856,13 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
 		if (dev->cb && keepBlock)
 			dev->cb(xfer->buffer, xfer->actual_length, dev->cb_ctx);
 
+#ifdef _WIN32
+		/* not while cancelling: the cancel path waits for every transfer */
+		if (RTLSDR_RUNNING == dev->async_status && libusb_submit_transfer(xfer) == 0)
+			dev->xfer_inflight++;
+#else
 		libusb_submit_transfer(xfer); /* resubmit transfer */
+#endif
 		dev->xfer_errors = 0;
 	} else if (LIBUSB_TRANSFER_CANCELLED != xfer->status) {
 #ifndef _WIN32
@@ -4010,6 +4048,31 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 		dev->xfer_buf_len = DEFAULT_BUF_LENGTH;
 
 	_rtlsdr_alloc_async_buffers(dev);
+#ifdef _WIN32
+	dev->xfer_inflight = 0;
+	/* WinUSB's default pipe policy hands the queued reads to the host
+	 * controller one at a time. In the gaps between them the RTL2832U's
+	 * small FIFO overflows and it drops whole 188-byte packets (94 samples):
+	 * measured 3-4 drops a minute on a KrakenSDR, each leaving a tuner out
+	 * of sample alignment with the others. RAW_IO passes every queued
+	 * transfer straight to the controller, so the endpoint never idles - no
+	 * drop in the same tests, with retunes and gain changes too. It needs
+	 * transfers of a multiple of the max packet size (buf_len is a multiple
+	 * of 512, above), at most the endpoint's RAW_IO maximum. */
+#if defined(LIBUSB_API_VERSION) && LIBUSB_API_VERSION >= 0x0100010C
+	if (libusb_endpoint_supports_raw_io(dev->devh, 0x81) == 1) {
+		int raw_max = libusb_get_max_raw_io_transfer_size(dev->devh, 0x81);
+		if (raw_max <= 0 || dev->xfer_buf_len > (uint32_t)raw_max ||
+		    libusb_endpoint_set_raw_io(dev->devh, 0x81, 1) != 0)
+			fprintf(stderr, "WinUSB RAW_IO not enabled (buffer %u, max %d) - "
+				"the tuner can drop samples\n", dev->xfer_buf_len, raw_max);
+	}
+#elif defined(_MSC_VER) /* older MSVC has no #warning */
+#pragma message("libusb older than 1.0.30: WinUSB RAW_IO is not enabled - tuners drop samples (update libusb)")
+#else
+#warning "libusb older than 1.0.30: WinUSB RAW_IO is not enabled - tuners drop samples (update libusb)"
+#endif
+#endif
 
 	for(i = 0; i < dev->xfer_buf_num; ++i) {
 		libusb_fill_bulk_transfer(dev->xfer[i],
@@ -4022,6 +4085,10 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 						BULK_TIMEOUT);
 
 		r = libusb_submit_transfer(dev->xfer[i]);
+#ifdef _WIN32
+		if (r == 0)
+			dev->xfer_inflight++;
+#endif
 		if (r < 0) {
 			fprintf(stderr, "Failed to submit transfer %i\n"
 					"Please increase your allowed "
@@ -4045,6 +4112,27 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 		}
 
 		if (RTLSDR_CANCELING == dev->async_status) {
+#ifdef _WIN32
+			/* the upstream loop below re-cancels transfers that are already
+			 * cancelling (LIBUSB_ERROR_NOT_FOUND), takes that for "done" and
+			 * frees transfers libusb still completes afterwards - rtlsdr_close()
+			 * then crashed (use after free) */
+			struct timeval waittv = { 0, 50000 };
+			int rounds;
+			if (dev->xfer) {
+				for (i = 0; i < dev->xfer_buf_num; ++i)
+					if (dev->xfer[i])
+						libusb_cancel_transfer(dev->xfer[i]);
+			}
+			for (rounds = 0; dev->xfer_inflight > 0 && rounds < 100; rounds++) /* <= 5 s */
+				libusb_handle_events_timeout_completed(dev->ctx, &waittv, NULL);
+			if (dev->xfer_inflight > 0)
+				fprintf(stderr, "rtlsdr_read_async: %d transfers did not finish cancelling\n",
+					dev->xfer_inflight);
+			next_status = RTLSDR_INACTIVE;
+			r = 0;
+			break;
+#endif
 			next_status = RTLSDR_INACTIVE;
 
 			if (!dev->xfer)
