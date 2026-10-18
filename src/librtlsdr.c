@@ -75,6 +75,59 @@ static int rtlsdr_ctrl_transfer_retry(libusb_device_handle *devh, uint8_t reques
 	return r;
 }
 #define libusb_control_transfer rtlsdr_ctrl_transfer_retry
+
+#if defined(LIBUSB_API_VERSION) && LIBUSB_API_VERSION >= 0x0100010C
+/* WinUSB RAW_IO on the bulk IN endpoint (see rtlsdr_read_async): on = 1
+ * enables it for transfers of buf_len, returns 1 if it is on; on = 0 goes
+ * back to the default policy. The DLL looks the three functions (libusb
+ * 1.0.30+) up at run time: imported, it would not load at all next to an
+ * older libusb-1.0.dll, which SDR applications often ship. They are looked
+ * up in the module of the libusb this DLL uses (where its version data is),
+ * never another libusb-1.0.dll of the process. A DLL with libusb linked in
+ * finds them only when built with -DRTLSDR_LIBUSB_STATIC. */
+static int rtlsdr_raw_io(libusb_device_handle *devh, uint32_t buf_len, int on)
+{
+	typedef int (LIBUSB_CALL *supports_fn)(libusb_device_handle *, uint8_t);
+	typedef int (LIBUSB_CALL *max_fn)(libusb_device_handle *, uint8_t);
+	typedef int (LIBUSB_CALL *set_fn)(libusb_device_handle *, uint8_t, int);
+	supports_fn p_supports = NULL;
+	max_fn p_max = NULL;
+	set_fn p_set = NULL;
+	int raw_max;
+#if (defined(rtlsdr_EXPORTS) || defined(DLL_EXPORT)) && !defined(RTLSDR_LIBUSB_STATIC)
+	MEMORY_BASIC_INFORMATION mbi;
+	if (VirtualQuery(libusb_get_version(), &mbi, sizeof(mbi)) && mbi.AllocationBase) {
+		HMODULE um = (HMODULE)mbi.AllocationBase;
+		p_supports = (supports_fn)(void (*)(void))GetProcAddress(um, "libusb_endpoint_supports_raw_io");
+		p_max = (max_fn)(void (*)(void))GetProcAddress(um, "libusb_get_max_raw_io_transfer_size");
+		p_set = (set_fn)(void (*)(void))GetProcAddress(um, "libusb_endpoint_set_raw_io");
+	}
+	if (!p_supports || !p_max || !p_set) {
+		if (on)
+			fprintf(stderr, "WinUSB RAW_IO not enabled (libusb-1.0.dll older than "
+				"1.0.30) - the tuner can drop samples\n");
+		return 0;
+	}
+#else
+	p_supports = libusb_endpoint_supports_raw_io;
+	p_max = libusb_get_max_raw_io_transfer_size;
+	p_set = libusb_endpoint_set_raw_io;
+#endif
+	if (p_supports(devh, 0x81) != 1)
+		return 0;
+	if (!on) {
+		p_set(devh, 0x81, 0);
+		return 0;
+	}
+	raw_max = p_max(devh, 0x81);
+	if (raw_max > 0 && buf_len <= (uint32_t)raw_max && p_set(devh, 0x81, 1) == 0)
+		return 1;
+	p_set(devh, 0x81, 0); /* a stream that could not switch it off left it on */
+	fprintf(stderr, "WinUSB RAW_IO not enabled (buffer %u, max %d) - "
+		"the tuner can drop samples\n", buf_len, raw_max);
+	return 0;
+}
+#endif
 #endif
 #ifndef WIN32
 #include "rtlsdr_rpc.h"
@@ -305,7 +358,10 @@ struct rtlsdr_dev {
 	int driver_active;
 	unsigned int xfer_errors;
 #ifdef _WIN32
-	int xfer_inflight; /* submitted, callback not run yet (Windows cancel path) */
+	/* submitted, callback not finished (Windows cancel path). Callbacks can
+	 * run on any thread in libusb_handle_events*, also a thread making a
+	 * synchronous control transfer (tuning), hence Interlocked */
+	volatile LONG xfer_inflight;
 #endif
 	int i2c_repeater_on;
 	int rc_active;
@@ -3845,9 +3901,6 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
 {
 	rtlsdr_dev_t *dev = (rtlsdr_dev_t *)xfer->user_data;
 
-#ifdef _WIN32
-	dev->xfer_inflight--;
-#endif
 	if (LIBUSB_TRANSFER_COMPLETED == xfer->status) {
 		int keepBlock = 1;
 		if ( dev->softagc.agcState != SOFTSTATE_OFF )
@@ -3858,8 +3911,11 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
 
 #ifdef _WIN32
 		/* not while cancelling: the cancel path waits for every transfer */
-		if (RTLSDR_RUNNING == dev->async_status && libusb_submit_transfer(xfer) == 0)
-			dev->xfer_inflight++;
+		if (RTLSDR_RUNNING == dev->async_status) {
+			InterlockedIncrement(&dev->xfer_inflight);
+			if (libusb_submit_transfer(xfer) != 0)
+				InterlockedDecrement(&dev->xfer_inflight);
+		}
 #else
 		libusb_submit_transfer(xfer); /* resubmit transfer */
 #endif
@@ -3880,6 +3936,10 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
 		}
 #endif
 	}
+#ifdef _WIN32
+	/* last: once it reaches 0 the cancel path frees xfer and its buffer */
+	InterlockedDecrement(&dev->xfer_inflight);
+#endif
 }
 
 int rtlsdr_wait_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx)
@@ -4009,6 +4069,12 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 	struct timeval tv = { 1, 0 };
 	struct timeval zerotv = { 0, 0 };
 	enum rtlsdr_async_status next_status = RTLSDR_INACTIVE;
+#ifdef _WIN32
+	int submit_err = 0;
+#if defined(LIBUSB_API_VERSION) && LIBUSB_API_VERSION >= 0x0100010C
+	int raw_io = 0;
+#endif
+#endif
 
 	if (dev && !dev->called_set_opt )
 		rtlsdr_process_env_opts(dev);
@@ -4058,15 +4124,10 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 	 * transfer straight to the controller, so the endpoint never idles - no
 	 * drop in the same tests, with retunes and gain changes too. It needs
 	 * transfers of a multiple of the max packet size (buf_len is a multiple
-	 * of 512, above), at most the endpoint's RAW_IO maximum. */
+	 * of 512, above), at most the endpoint's RAW_IO maximum. Switched off
+	 * again at the end: rtlsdr_read_sync of any length needs the default. */
 #if defined(LIBUSB_API_VERSION) && LIBUSB_API_VERSION >= 0x0100010C
-	if (libusb_endpoint_supports_raw_io(dev->devh, 0x81) == 1) {
-		int raw_max = libusb_get_max_raw_io_transfer_size(dev->devh, 0x81);
-		if (raw_max <= 0 || dev->xfer_buf_len > (uint32_t)raw_max ||
-		    libusb_endpoint_set_raw_io(dev->devh, 0x81, 1) != 0)
-			fprintf(stderr, "WinUSB RAW_IO not enabled (buffer %u, max %d) - "
-				"the tuner can drop samples\n", dev->xfer_buf_len, raw_max);
-	}
+	raw_io = rtlsdr_raw_io(dev->devh, dev->xfer_buf_len, 1);
 #elif defined(_MSC_VER) /* older MSVC has no #warning */
 #pragma message("libusb older than 1.0.30: WinUSB RAW_IO is not enabled - tuners drop samples (update libusb)")
 #else
@@ -4084,10 +4145,15 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 						(void *)dev,
 						BULK_TIMEOUT);
 
+#ifdef _WIN32
+		InterlockedIncrement(&dev->xfer_inflight);
+#endif
 		r = libusb_submit_transfer(dev->xfer[i]);
 #ifdef _WIN32
-		if (r == 0)
-			dev->xfer_inflight++;
+		if (r < 0) {
+			InterlockedDecrement(&dev->xfer_inflight);
+			submit_err = r;
+		}
 #endif
 		if (r < 0) {
 			fprintf(stderr, "Failed to submit transfer %i\n"
@@ -4128,9 +4194,9 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 				libusb_handle_events_timeout_completed(dev->ctx, &waittv, NULL);
 			if (dev->xfer_inflight > 0)
 				fprintf(stderr, "rtlsdr_read_async: %d transfers did not finish cancelling\n",
-					dev->xfer_inflight);
+					(int)dev->xfer_inflight);
 			next_status = RTLSDR_INACTIVE;
-			r = 0;
+			r = submit_err; /* < 0: the stream never fully started (as upstream) */
 			break;
 #endif
 			next_status = RTLSDR_INACTIVE;
@@ -4168,6 +4234,11 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 		}
 	}
 
+#if defined(_WIN32) && defined(LIBUSB_API_VERSION) && LIBUSB_API_VERSION >= 0x0100010C
+	/* libusb: RAW_IO is never changed with transfers in progress */
+	if (raw_io && dev->xfer_inflight == 0)
+		rtlsdr_raw_io(dev->devh, 0, 0);
+#endif
 	_rtlsdr_free_async_buffers(dev);
 
 	dev->async_status = next_status;
