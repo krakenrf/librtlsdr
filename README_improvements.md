@@ -42,6 +42,16 @@ against librtlsdr's development branch (initially same date, but updated 2020-10
     * total gain range now up to 100 dB
   * deactivated "Filter extension under weak signal" for a stable filter characteristic
   * added shifting of IF-center, to receive away from DC. see `rtlsdr_set_tuner_band_center()`
+  * faster retuning - fewer USB control transfers per frequency / gain change:
+    * register writes of the value the chip already holds are skipped (as osmocom 0b64f07); a failed write marks its registers unknown, so they are written again. `rtlsdr_set_tuner_if_mode()` still writes the IF VGA register (0x0c) every time
+    * N / SDM (0x14..0x16) go out as one ascending I2C write; after a tune that changed the VCO divider or the band, the PLL lock is read 5 ms later (`R82XX_PLL_SETTLE_US`; the lock read came too early there: a lock retry at every divider point, and on some dongles 0x0b / 0x0c read 0xff afterwards). A Raspberry Pi 5 (~2.4 ms per control transfer) still retried with 1.5 ms and not with 2 / 2.5 / 3 / 5 ms, so the PLL needs about 4 ms; 5 ms is meant to leave room for hosts whose transfers are ~10x faster (x86 Linux, not measured), which get almost no time from the transfer itself. Only divider / band crossings wait (Windows: +3-4 ms per tuner there against 2 ms)
+    * register 4 (VCO fine tune) is still read on every tune, and the lock read is 3 bytes, as before
+    * the I2C repeater stays on between tuner accesses; a demod soft reset or a failed I2C transfer clears its flag, so the next tuner access switches it on again. Outside Windows each tuner access then starts with a dummy demod read (without it, I2C writes failed on a Raspberry Pi 5)
+    * a control OUT that the RTL2832U stalls (LIBUSB_ERROR_PIPE) is repeated after a dummy demod read, at most 3 times, on every platform (`rtlsdr_ctrl_transfer_retry`; a read and any other error are never retried). On Windows (WinUSB) the first OUT after a quiet spell stalls while the dongle streams; on a Raspberry Pi 5 a pause of 300 ms or more inside a tuner access stalled the next I2C write every time (also with the library before these changes; 200 ms or less: never), and the write repeated after a read went through every time (pauses up to 1.5 s, measured first with the pauses and the retry injected by a test shim; with this code, a shim injecting only the pauses, 300 / 600 / 1500 ms: at each pause 79 of 79 failed tuner writes recovered, 78 at the first retry and 1 at the second, against 52 failed and none recovered with the library before these changes). Every control OUT of the library stores register values (demod / USB / GPIO registers, I2C tuner and EEPROM writes), so a repeat leaves the same state. An I2C NACK (the tuner probe at open, a busy EEPROM) is a PIPE as well: it costs up to 6 more transfers before it is returned (on Linux now too: 2 absent tuners probed per R820T dongle at open, 6 more writes and 6 more dummy reads per dongle - measured on the Raspberry Pi 5)
+    * a 25 kHz retune: 18 transfers before, 5 on Windows, 6 on Linux (measured on a KrakenSDR: a Windows PC and a Raspberry Pi 5)
+    * `rtlsdr_set_center_freq_fast()` / `rtlsdr_finish_tune()` for drags (see below): 3 transfers per step on Windows, 4 on Linux
+    * measured 2026-10-19, five streaming dongles, 25 kHz steps: Windows (tuned one by one, ~4 ms per transfer) 422 ms per retune of all five before, 112.5 ms now, drag steps 72.4 ms; Raspberry Pi 5 (in parallel threads) 43.6 / 14.5 / 9.9 ms. No lock retries, lock failures or wrong VCO dividers in 24-1766 MHz sweeps, drags across every divider boundary and 15-30 min soaks; registers as before at every frequency (with the 2 ms and again with the 5 ms wait; the step times above are the same with both)
+    * rtl_power's 757-810 MHz LTE band reads a few dB higher than before (Raspberry Pi 5, 24-900 MHz): the faster retune leaves its first block of a hop inside the RTL2832 AGC's settling - with 50 ms after each retune both libraries read the same
 
 * harmonic reception for R820T/2 tuner:
 
@@ -114,6 +124,11 @@ new alternative: environment variable **LIBRTLSDR_OPT**
 * added rtlsdr_set_center_freq64(), to set frequencies above ~4.29 GHz, the 32-bit limit
 * added rtlsdr_get_center_freq64()
 * added rtlsdr_set_harmonic_rx() to activate/change harmonic reception
+* added rtlsdr_set_center_freq_fast(), retuning for a drag (a run of retunes close together) with less USB traffic - R820T/2 / R828D without direct sampling:
+ RTLSDR_TUNE_KEEP_AUTOTUNE keeps the PLL autotune clock at 128 kHz between the steps (the PLL lock is still checked on every call),
+ RTLSDR_TUNE_SPAN_AUTOTUNE writes the 128 kHz clock together with N / SDM
+* added rtlsdr_finish_tune(), to end such a drag: reads the PLL lock, then sets the 8 kHz autotune clock;
+ returns 1 when the PLL didn't lock (tune again with rtlsdr_set_center_freq())
 
 
 ## Added Tools

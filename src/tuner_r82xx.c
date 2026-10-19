@@ -46,6 +46,52 @@
 /* #define VGA_FOR_AGC_MODE	16 */
 #define DEFAULT_IF_VGA_VAL	11
 
+/* After a tune that changed the VCO divider (0x10 [7:5]) or the band
+ * (r82xx_set_mux), the PLL lock is read only this long after N / SDM went
+ * out. N and SDM are one I2C write here, so the lock read follows them by
+ * one control transfer - osmocom's four separate writes gave the PLL three
+ * more. Read that early, the PLL hadn't locked yet at the divider points
+ * (a lock retry with the VCO current raised), and on some dongles the chip
+ * then held 0x0b / 0x0c = 0xff afterwards (IF VGA at its maximum, 13-15 dB
+ * louder). Measured on a KrakenSDR (five R820T), 24-1766 MHz sweeps: Windows
+ * (4 ms per control transfer) no retry from 1500 us on, a Raspberry Pi 5
+ * (2.4 ms) still at 1500 us and none from 2000 us (2500 / 3000 / 5000 us:
+ * none either). So the PLL needed more than 1.5 ms plus the Pi's ~2.4 ms
+ * transfer, i.e. about 4 ms from the N / SDM write; a host whose control
+ * transfers are ~10x faster (x86 Linux, ~0.25 ms) gets almost nothing from
+ * the transfer, so the wait alone has to cover that: 5000 us. It costs that
+ * much only at divider / band crossings (a few tunes in a 24-1766 MHz
+ * sweep), still less than the lock retry it avoids. Ordinary drag steps
+ * (same divider, same band) don't wait. */
+#define R82XX_PLL_SETTLE_US	5000
+
+#ifdef _WIN32
+#include <windows.h>
+static void r82xx_settle_wait(unsigned int us)
+{
+	LARGE_INTEGER f, t0, t;
+
+	/* busy wait: Sleep() is 1 ms at best, often a 15.6 ms timer tick */
+	QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&t0);
+	do
+		QueryPerformanceCounter(&t);
+	while ((t.QuadPart - t0.QuadPart) * 1000000 < (LONGLONG)us * f.QuadPart);
+}
+#else
+#include <time.h>
+#include <errno.h>
+static void r82xx_settle_wait(unsigned int us)
+{
+	struct timespec ts;
+
+	ts.tv_sec = us / 1000000;
+	ts.tv_nsec = (long)(us % 1000000) * 1000L;
+	while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {
+	}
+}
+#endif
+
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define MHZ(x)		((x)*1000*1000)
@@ -552,6 +598,24 @@ static void shadow_store(struct r82xx_priv *priv, uint8_t reg, const uint8_t *va
 	memcpy(&priv->regs[r], val, len);
 }
 
+/* regs_unsynced: the shadow is updated before the I2C write, so a write that
+ * fails leaves registers whose value the chip may not have - they are never
+ * skipped as unchanged (r82xx_reg_changed) until written successfully */
+static void r82xx_mark_unsynced(struct r82xx_priv *priv, uint8_t reg, int len, int unsynced)
+{
+	int i, r;
+
+	for (i = 0; i < len; i++) {
+		r = reg + i - REG_SHADOW_START;
+		if (r < 0 || r >= NUM_REGS)
+			continue;
+		if (unsynced)
+			priv->regs_unsynced |= 1u << r;
+		else
+			priv->regs_unsynced &= ~(1u << r);
+	}
+}
+
 static int r82xx_write_arr(struct r82xx_priv *priv, uint8_t reg, const uint8_t *val,
 			   unsigned int len)
 {
@@ -572,7 +636,10 @@ static int r82xx_write_arr(struct r82xx_priv *priv, uint8_t reg, const uint8_t *
 
 		/* override data in buffer */
 		for ( k = 0; k < size; ++k ) {
-			regOff = pos + k;
+			/* reg already points at this chunk: pos + k counted the chunks
+			 * before it twice - the init write's last chunk read
+			 * override_mask[] past its end (the next struct member) */
+			regOff = k;
 			regIdx = reg - REG_SHADOW_START + regOff;
 			if ( priv->override_mask[regIdx] ) {
 				uint8_t oldBuf = priv->buf[1 + k];
@@ -592,6 +659,8 @@ static int r82xx_write_arr(struct r82xx_priv *priv, uint8_t reg, const uint8_t *
 
 		rc = rtlsdr_i2c_write_fn(priv->rtl_dev, priv->cfg->i2c_addr,
 					 priv->buf, size + 1);
+		/* failed: this chunk and the ones not written yet */
+		r82xx_mark_unsynced(priv, reg, rc == size + 1 ? size : (int)len, rc != size + 1);
 
 		if (rc != size + 1) {
 			fprintf(stderr, "%s: i2c wr failed=%d reg=%02x len=%d\n",
@@ -635,6 +704,42 @@ int r82xx_write_reg_mask(struct r82xx_priv *priv, uint8_t reg, uint8_t val, uint
 
 	return r82xx_write_arr(priv, reg, &val, 1);
 }
+
+/* Every register write is a USB control transfer, and a tuner retune was 18
+ * of them (with the I2C repeater switches) - on Windows ~4 ms each (the
+ * KrakenSDR's five dongles on an AMD chipset USB controller, one at a time
+ * for all five). Registers written with the value the chip already holds are
+ * skipped - the tuner ends up programmed exactly as before, as osmocom
+ * rtl-sdr has done since v2.0.2 (0b64f07). Used on the retune and gain paths
+ * only (r82xx_set_mux, r82xx_set_pll, r82xx_set_gain and the IF VGA write
+ * it makes); every other write goes out as before - also the IF VGA (0x0c)
+ * of rtlsdr_set_tuner_if_mode(), so it rewrites a register the chip may
+ * have lost (heimdall calls it after every gain change). */
+static int r82xx_reg_changed(struct r82xx_priv *priv, uint8_t reg, uint8_t val)
+{
+	int r = reg - REG_SHADOW_START;
+
+	if (r < 0 || r >= NUM_REGS)
+		return 1;
+
+	return priv->regs[r] != val || (priv->regs_unsynced & (1u << r)) || priv->override_mask[r];
+}
+
+static int r82xx_write_reg_mask_changed(struct r82xx_priv *priv, uint8_t reg, uint8_t val,
+					uint8_t bit_mask)
+{
+	int rc = r82xx_read_cache_reg(priv, reg);
+
+	if (rc < 0)
+		return rc;
+
+	val = (rc & ~bit_mask) | (val & bit_mask);
+	if (!r82xx_reg_changed(priv, reg, val))
+		return 0;
+
+	return r82xx_write_arr(priv, reg, &val, 1);
+}
+#define r82xx_write_reg_changed(priv, reg, val) r82xx_write_reg_mask_changed(priv, reg, val, 0xff)
 
 int r82xx_write_reg_mask_ext(struct r82xx_priv *priv, uint8_t reg, uint8_t val,
 	uint8_t bit_mask, const char * func_name)
@@ -720,19 +825,29 @@ static int r82xx_set_mux(struct r82xx_priv *priv, uint64_t freq)
 			break;
 	}
 	range = &freq_ranges[i];
+	if ((int)i != priv->mux_range)
+		priv->pll_settle = 1;	/* new band: r82xx_set_pll waits before the lock read */
+	priv->mux_range = (int)i;
 
 	/* Open Drain */
-	rc = r82xx_write_reg_mask(priv, 0x17, range->open_d, 0x08);
+	rc = r82xx_write_reg_mask_changed(priv, 0x17, range->open_d, 0x08);
 	if (rc < 0)
 		return rc;
 
-	/* RF_MUX,Polymux */
-	rc = r82xx_write_reg_mask(priv, 0x1a, range->rf_mux_ploy, 0xc3);
-	if (rc < 0)
-		return rc;
+	/* RF_MUX,Polymux and TF BAND - one I2C write (0x1a, 0x1b ascending, the
+	 * order of the two writes) when both change, as on most band changes */
+	val = (r82xx_read_cache_reg(priv, 0x1a) & ~0xc3) | (range->rf_mux_ploy & 0xc3);
+	if (r82xx_reg_changed(priv, 0x1a, val) && r82xx_reg_changed(priv, 0x1b, range->tf_c)) {
+		uint8_t mux_regs[2];
 
-	/* TF BAND */
-	rc = r82xx_write_reg(priv, 0x1b, range->tf_c);
+		mux_regs[0] = val;
+		mux_regs[1] = range->tf_c;
+		rc = r82xx_write_arr(priv, 0x1a, mux_regs, 2);
+	} else {
+		rc = r82xx_write_reg_changed(priv, 0x1a, val);
+		if (rc >= 0)
+			rc = r82xx_write_reg_changed(priv, 0x1b, range->tf_c);
+	}
 	if (rc < 0)
 		return rc;
 
@@ -753,7 +868,7 @@ static int r82xx_set_mux(struct r82xx_priv *priv, uint64_t freq)
 		val = range->xtal_cap0p | 0x08;
 		break;
 	}
-	rc = r82xx_write_reg_mask(priv, 0x10, val, 0x0b);
+	rc = r82xx_write_reg_mask_changed(priv, 0x10, val, 0x0b);
 
 	return rc;
 }
@@ -949,15 +1064,25 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	freq_khz = (freq + 500) / 1000;
 	pll_ref = priv->cfg->xtal;
 
-	rc = r82xx_write_reg_mask(priv, 0x10, refdiv2, 0x10);
+	rc = r82xx_write_reg_mask_changed(priv, 0x10, refdiv2, 0x10);
 	if (rc < 0) {
 		if (priv->cfg->verbose)
 			fprintf(stderr, "r82xx_set_pll(): error writing 'refdiv2' into i2c reg 0x10\n");
 		return rc;
 	}
 
-	/* set pll autotune = 128kHz */
-	rc = r82xx_write_reg_mask(priv, 0x1a, 0x00, 0x0c);
+	/* set pll autotune = 128kHz. A fast tune (rtlsdr_set_center_freq_fast)
+	 * with SPAN_AUTOTUNE writes it together with N / SDM below; with
+	 * KEEP_AUTOTUNE only when the clock isn't at 128 kHz already (the first
+	 * tune of a drag). From here until the 8 kHz write the clock may be at
+	 * 128 kHz - even if this write fails: r82xx_finish_tune() has work. */
+	priv->tune_pending = 1;
+	if (priv->tune_flags & R82XX_TUNE_SPAN_AUTOTUNE)
+		rc = 0;
+	else if (priv->tune_flags & R82XX_TUNE_KEEP_AUTOTUNE)
+		rc = r82xx_write_reg_mask_changed(priv, 0x1a, 0x00, 0x0c);
+	else
+		rc = r82xx_write_reg_mask(priv, 0x1a, 0x00, 0x0c);
 	if (rc < 0) {
 		if (priv->cfg->verbose)
 			fprintf(stderr, "r82xx_set_pll(): error writing 'pll autotune 128kHz' into i2c reg 0x1a\n");
@@ -994,6 +1119,10 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 		mix_div = mix_div << 1;
 	}
 
+	/* register 4 (VCO fine tune) is read on every tune, as osmocom does: a
+	 * copy kept from the previous tune's lock read was stale right after a
+	 * VCO divider change (fine tune bits not settled yet), and the next
+	 * tune then wrote a wrong divider - off frequency, lock bit set */
 	rc = r82xx_read(priv, 0x00, data, sizeof(data));
 	if (rc < 0) {
 		if (priv->cfg->verbose)
@@ -1011,7 +1140,13 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	else if (vco_fine_tune < vco_power_ref)
 		div_num = div_num + 1;
 
-	rc = r82xx_write_reg_mask(priv, 0x10, div_num << 5, 0xe0);
+	/* a new divider (or one the chip may not hold): wait before the lock
+	 * read. Kept until a lock read has waited - a tune that stops earlier
+	 * leaves it to the next one */
+	if (r82xx_reg_changed(priv, 0x10, (uint8_t)((r82xx_read_cache_reg(priv, 0x10) & ~0xe0) | (div_num << 5))))
+		priv->pll_settle = 1;
+
+	rc = r82xx_write_reg_mask_changed(priv, 0x10, div_num << 5, 0xe0);
 	if (rc < 0) {
 		if (priv->cfg->verbose)
 			fprintf(stderr, "r82xx_set_pll(): error writing 'div_num' into i2c reg 0x10\n");
@@ -1058,48 +1193,65 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	ni = (nint - 13) / 4;
 	si = nint - 4 * ni - 13;
 
-	rc = r82xx_write_reg(priv, 0x14, ni + (si << 6));
-	if (rc < 0) {
-		if (priv->cfg->verbose)
-			fprintf(stderr, "r82xx_set_pll(): error writing 'ni+(si<<6)' into i2c reg 0x14\n");
-		return rc;
-	}
-
-	/* pw_sdm */
-	if (sdm == 0)
-		val = 0x08;
-	else
-		val = 0x00;
-
+	/* pw_sdm / dither, then N and SDM in ONE I2C write: from 0x14 (only if
+	 * it changed) or 0x15 to 0x16 (only if it changed) - SDM low before
+	 * high, as osmocom's batched tuning write (2acb75c) and
+	 * r82xx_set_pll_yc() order them. 0x15 always goes out, so the PLL is
+	 * programmed the same way whichever register write takes it over. */
+	val = (sdm == 0) ? 0x08 : 0x00;
 	if (priv->disable_dither)
 		val |= 0x10;
 
-	rc = r82xx_write_reg_mask(priv, 0x12, val, 0x18);
+	rc = r82xx_write_reg_mask_changed(priv, 0x12, val, 0x18);
 	if (rc < 0) {
 		if (priv->cfg->verbose)
 			fprintf(stderr, "r82xx_set_pll(): error writing 'dither' into i2c reg 0x12\n");
 		return rc;
 	}
+	{
+		uint8_t pll_regs[7];
+		int first, last;
 
-	rc = r82xx_write_reg(priv, 0x16, sdm >> 8);
-	if (rc < 0) {
-		if (priv->cfg->verbose)
-			fprintf(stderr, "r82xx_set_pll(): error writing 'sdm hi' into i2c reg 0x16\n");
-		return rc;
-	}
-	rc = r82xx_write_reg(priv, 0x15, sdm & 0xff);
-	if (rc < 0) {
-		if (priv->cfg->verbose)
-			fprintf(stderr, "r82xx_set_pll(): error writing 'sdm lo' into i2c reg 0x12\n");
-		return rc;
+		pll_regs[0] = ni + (si << 6);
+		pll_regs[1] = sdm & 0xff;
+		pll_regs[2] = sdm >> 8;
+		first = r82xx_reg_changed(priv, 0x14, pll_regs[0]) ? 0 : 1;
+		last = r82xx_reg_changed(priv, 0x16, pll_regs[2]) ? 2 : 1;
+		if (priv->tune_flags & R82XX_TUNE_SPAN_AUTOTUNE) {
+			/* the 128 kHz autotune clock in the same write, after N / SDM
+			 * (with KEEP_AUTOTUNE only when it isn't at 128 kHz already):
+			 * 0x17-0x19 are write-only - the chip holds what was last
+			 * written - and go out with their cached values. 0x14..0x1a =
+			 * 7 bytes, one transfer (max_i2c_msg_len 8) */
+			pll_regs[3] = (uint8_t)r82xx_read_cache_reg(priv, 0x17);
+			pll_regs[4] = (uint8_t)r82xx_read_cache_reg(priv, 0x18);
+			pll_regs[5] = (uint8_t)r82xx_read_cache_reg(priv, 0x19);
+			pll_regs[6] = (uint8_t)(r82xx_read_cache_reg(priv, 0x1a) & ~0x0c);
+			if (!(priv->tune_flags & R82XX_TUNE_KEEP_AUTOTUNE) ||
+			    r82xx_reg_changed(priv, 0x1a, pll_regs[6]))
+				last = 6;
+		}
+		rc = r82xx_write_arr(priv, 0x14 + first, &pll_regs[first], last - first + 1);
+		if (rc < 0) {
+			if (priv->cfg->verbose)
+				fprintf(stderr, "r82xx_set_pll(): error writing 'ni+(si<<6)' / 'sdm' into i2c reg 0x14..0x16\n");
+			return rc;
+		}
 	}
 
 	/* all PLL stuff / registers set for this frequency - except 8 kHz pll autotune */
 	priv->tuner_pll_set = 1;
 
+	if (priv->pll_settle) {
+		r82xx_settle_wait(R82XX_PLL_SETTLE_US);
+		priv->pll_settle = 0;
+	}
+
 	for (i = 0; i < 2; i++) {
 
-		/* Check if PLL has locked */
+		/* Check if PLL has locked - registers 0..2 only, as osmocom: reading
+		 * 3 / 4 too while the PLL settled after a divider change was
+		 * followed by the 0x0b / 0x0c corruption (see R82XX_PLL_SETTLE_US) */
 		rc = r82xx_read(priv, 0x00, data, 3);
 		if (rc < 0) {
 			if (priv->cfg->verbose)
@@ -1137,12 +1289,55 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 
 	priv->has_lock = 1;
 
+	/* fast tune of a drag: the autotune clock stays at 128 kHz -
+	 * r82xx_finish_tune() writes 8 kHz once the drag is over */
+	if (priv->tune_flags & R82XX_TUNE_KEEP_AUTOTUNE)
+		return 0;
+
 	/* set pll autotune = 8kHz */
 	rc = r82xx_write_reg_mask(priv, 0x1a, 0x08, 0x08);
 	if (rc < 0 && priv->cfg->verbose)
 		fprintf(stderr, "r82xx_set_pll(): error writing 'pll autotune 8kHz' into i2c reg 0x1a\n");
+	if (rc >= 0)
+		priv->tune_pending = 0;
 
 	return rc;
+}
+
+/* after fast tunes (rtlsdr_set_center_freq_fast with KEEP_AUTOTUNE): the
+ * state a full tune leaves - a lock check, then the 8 kHz autotune clock.
+ * The lock is read first: on Windows a control OUT after a quiet spell
+ * stalls until an IN, and the drag is ~0.4 s over when this runs.
+ * 0 = done (nothing pending: no transfer), 1 = not locked (tune again on
+ * the full path), < 0 = I2C error */
+int r82xx_finish_tune(struct r82xx_priv *priv)
+{
+	uint8_t data[3];
+	int rc;
+
+	if (!priv->tune_pending)
+		return 0;
+	if (!priv->tuner_pll_set)
+		return 1;	/* the last tune stopped before N / SDM went out */
+
+	rc = r82xx_read(priv, 0x00, data, sizeof(data));	/* lock bit: register 2 */
+	if (rc < 0)
+		return rc;
+	if (!(data[2] & 0x40)) {
+		if (priv->cfg->verbose || PRINT_PLL_ERRORS)
+			fprintf(stderr, "[R82XX] PLL not locked at the end of a drag (RF %f MHz)!\n",
+				priv->rf_freq * 1E-6);
+		priv->has_lock = 0;
+		return 1;
+	}
+	priv->has_lock = 1;
+
+	/* set pll autotune = 8kHz */
+	rc = r82xx_write_reg_mask(priv, 0x1a, 0x08, 0x08);
+	if (rc < 0)
+		return rc;
+	priv->tune_pending = 0;
+	return 0;
 }
 
 
@@ -1409,6 +1604,8 @@ static int r82xx_get_vga_gain_from_index(int vga_index)
 }
 
 
+static int r82xx_set_if_mode_reg(struct r82xx_priv *priv, int if_mode, int *rtl_vga_control, int always);
+
 /* set HF gain (LNA/Mixer) and pass through for IF gain (VGA) */
 int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain,
   int extended_mode, int lna_gain_idx, int mixer_gain_idx, int vga_gain_idx, int *rtl_vga_control)
@@ -1424,12 +1621,12 @@ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain,
 		}
 
 		/* LNA auto off == manual */
-		rc = r82xx_write_reg_mask(priv, 0x05, 0x10, 0x10);
+		rc = r82xx_write_reg_mask_changed(priv, 0x05, 0x10, 0x10);
 		if (rc < 0)
 			return rc;
 
 		/* Mixer auto off == manual mode */
-		rc = r82xx_write_reg_mask(priv, 0x07, 0, 0x10);
+		rc = r82xx_write_reg_mask_changed(priv, 0x07, 0, 0x10);
 		if (rc < 0)
 			return rc;
 
@@ -1438,12 +1635,12 @@ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain,
 			return rc;
 
 		/* Set LNA */
-		rc = r82xx_write_reg_mask(priv, 0x05, lna_gain_idx, 0x0f);
+		rc = r82xx_write_reg_mask_changed(priv, 0x05, lna_gain_idx, 0x0f);
 		if (rc < 0)
 			return rc;
 
 		/* Set Mixer */
-		rc = r82xx_write_reg_mask(priv, 0x07, mixer_gain_idx, 0x0f);
+		rc = r82xx_write_reg_mask_changed(priv, 0x07, mixer_gain_idx, 0x0f);
 		if (rc < 0)
 			return rc;
 
@@ -1460,12 +1657,12 @@ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain,
 
 	} else {
 		/* LNA auto on = AGC */
-		rc = r82xx_write_reg_mask(priv, 0x05, 0, 0x10);
+		rc = r82xx_write_reg_mask_changed(priv, 0x05, 0, 0x10);
 		if (rc < 0)
 			return rc;
 
 		/* Mixer auto on = AGC */
-		rc = r82xx_write_reg_mask(priv, 0x07, 0x10, 0x10);
+		rc = r82xx_write_reg_mask_changed(priv, 0x07, 0x10, 0x10);
 		if (rc < 0)
 			return rc;
 
@@ -1479,7 +1676,7 @@ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain,
 	}
 
 	/* Set VGA */
-	rc = r82xx_set_if_mode(priv, new_if_mode, rtl_vga_control);
+	rc = r82xx_set_if_mode_reg(priv, new_if_mode, rtl_vga_control, 0);
 
 	return rc;
 }
@@ -1501,7 +1698,8 @@ int r82xx_get_if_gain(struct r82xx_priv *priv)
 
 
 /* set IF gain (VGA) */
-int r82xx_set_if_mode(struct r82xx_priv *priv, int if_mode, int *rtl_vga_control)
+/* always: write 0x0c even when the cache holds the value already */
+static int r82xx_set_if_mode_reg(struct r82xx_priv *priv, int if_mode, int *rtl_vga_control, int always)
 {
 	int rc = 0, vga_gain_idx = 0;
 
@@ -1537,7 +1735,14 @@ int r82xx_set_if_mode(struct r82xx_priv *priv, int if_mode, int *rtl_vga_control
 		(vga_gain_idx & 0x0f), (-12.0 + 3.5 * (vga_gain_idx & 0x0f)),
 		( (vga_gain_idx & 0x10) && rtl_vga_control ) ? "" : "de" );
 #endif
-	rc = r82xx_write_reg_mask(priv, 0x0c, vga_gain_idx, 0x1f);
+	/* rtlsdr_set_tuner_if_mode(): written even when unchanged - repairs a
+	 * 0x0c the chip lost (seen as 0xff after lock reads that came too early
+	 * at divider changes, see R82XX_PLL_SETTLE_US); from r82xx_set_gain()
+	 * only when it changed */
+	if (always)
+		rc = r82xx_write_reg_mask(priv, 0x0c, vga_gain_idx, 0x1f);
+	else
+		rc = r82xx_write_reg_mask_changed(priv, 0x0c, vga_gain_idx, 0x1f);
 	if (rc < 0)
 		return rc;
 	priv->last_if_mode = if_mode;
@@ -1546,6 +1751,11 @@ int r82xx_set_if_mode(struct r82xx_priv *priv, int if_mode, int *rtl_vga_control
 		*rtl_vga_control = 1;
 
 	return rc;
+}
+
+int r82xx_set_if_mode(struct r82xx_priv *priv, int if_mode, int *rtl_vga_control)
+{
+	return r82xx_set_if_mode_reg(priv, if_mode, rtl_vga_control, 1);
 }
 
 /* expose/permit tuner specific i2c register hacking! */
@@ -2148,6 +2358,13 @@ int r82xx_init(struct r82xx_priv *priv)
 	/* Initialize override registers */
 	memset( &(priv->override_data[0]), 0, NUM_REGS * sizeof(uint8_t) );
 	memset( &(priv->override_mask[0]), 0, NUM_REGS * sizeof(uint8_t) );
+
+	/* nothing is known about the chip until its registers are written */
+	priv->regs_unsynced = ~0u;
+	priv->mux_range = -1;
+	priv->pll_settle = 1;
+	priv->tune_flags = 0;
+	priv->tune_pending = 0;
 
 	/* Initialize registers */
 	rc = r82xx_write_arr(priv, 0x05,

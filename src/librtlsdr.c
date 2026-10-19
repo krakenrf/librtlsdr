@@ -51,15 +51,45 @@ typedef int socklen_t;
 
 #include <libusb.h>
 
-#ifdef _WIN32
-/* Windows: while the bulk transfers stream, an RTL2832U on WinUSB stalls
- * (LIBUSB_ERROR_PIPE) every control OUT after a quiet spell - every
- * register write of heimdall's lag servo failed - until a control IN has
- * been made: repeating the OUT fails for as long as one tries (measured:
- * 50 tries over 250 ms), one read in between and it goes through. So a
- * stalled OUT is retried after the dummy demod read librtlsdr already does
- * after each demod write (page 0x0a, register 0x01). Register reads and
- * writes are idempotent. Every control transfer of this file comes here. */
+/* A control OUT that the RTL2832U stalls (LIBUSB_ERROR_PIPE) is repeated
+ * after a control IN - the dummy demod read librtlsdr already makes after
+ * every demod write (page 0x0a, register 0x01) - at most 3 times. Only a
+ * PIPE on an OUT is retried: an IN (a read, possibly of a FIFO) never is,
+ * and any other error (TIMEOUT, NO_DEVICE, IO ...) and a short transfer are
+ * returned as they are. Every control transfer of this file comes here
+ * (the #define below; nothing else in librtlsdr calls libusb_control_transfer).
+ *  - Windows (WinUSB): while the bulk transfers stream, every control OUT
+ *    after a quiet spell stalls - every register write of heimdall's lag
+ *    servo failed - until a control IN has been made: repeating the OUT
+ *    fails for as long as one tries (measured: 50 tries over 250 ms), one
+ *    read in between and it goes through.
+ *  - Linux (usbfs): the same stall when a tuner access pauses. Measured on a
+ *    Raspberry Pi 5 with a KrakenSDR (5 R820T, streaming): a pause of 300,
+ *    400, 500 or 600 ms between two I2C writes of one tuner access and the
+ *    next write failed with PIPE every time (also in 00606c0), 10 / 50 /
+ *    200 ms never; the next write repeated after a demod read went through
+ *    every time. With this code (an LD_PRELOAD shim injecting pauses of
+ *    300 / 600 / 1500 ms only, 2026-10-20): at each pause 79 of 79 such
+ *    failed tuner writes recovered, 78 at the first retry, 1 at the
+ *    second; 00606c0 with the same pause lengths (at every 61st
+ *    tuner write instead of every 23rd): 52 failed writes, none
+ *    recovered. Linux still
+ *    does the read at the start of each tuner access as well
+ *    (rtlsdr_set_i2c_repeater): it keeps the stall from happening there.
+ * Safe to repeat: every OUT here stores register values - demod / USB /
+ * system registers (GPIO output and direction included, whose
+ * read-modify-write sits in the caller: only the write with its computed
+ * value is repeated), I2C writes to the tuner or the EEPROM (register or
+ * byte address + data, the same bytes again), the I2C repeater bit, the IR
+ * receiver's (rtl_ir only; its write-1-to-clear flags are cleared before
+ * the receiver is re-armed, so no new code can set them in between). Writing
+ * the same value twice leaves the same state; at worst a tuner restarts an
+ * internal sequence (PLL lock, filter calibration) that the driver waits
+ * for afterwards anyway. An I2C NACK is a PIPE too (the tuner probe at
+ * open: 4 stalls per dongle with an R820T - on Linux now 6 more writes and
+ * 6 more dummy reads per dongle, measured on the Pi 5; a busy EEPROM, not
+ * measured): it is
+ * retried and, if it persists, returned unchanged. */
 static int rtlsdr_ctrl_transfer_retry(libusb_device_handle *devh, uint8_t request_type,
 	uint8_t request, uint16_t value, uint16_t index, unsigned char *data, uint16_t length,
 	unsigned int timeout)
@@ -76,6 +106,7 @@ static int rtlsdr_ctrl_transfer_retry(libusb_device_handle *devh, uint8_t reques
 }
 #define libusb_control_transfer rtlsdr_ctrl_transfer_retry
 
+#ifdef _WIN32
 #if defined(LIBUSB_API_VERSION) && LIBUSB_API_VERSION >= 0x0100010C
 /* WinUSB RAW_IO on the bulk IN endpoint (see rtlsdr_read_async): on = 1
  * enables it for transfers of buf_len, returns 1 if it is on; on = 0 goes
@@ -948,21 +979,31 @@ uint8_t rtlsdr_i2c_read_reg(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t reg)
 int rtlsdr_i2c_write(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t *buffer, int len)
 {
 	uint16_t addr = i2c_addr;
+	int r;
 
 	if (!dev)
 		return -1;
 
-	return rtlsdr_write_array(dev, IICB, addr, buffer, len);
+	/* failed: the next tuner access writes the I2C repeater on again
+	 * (it stays on between accesses - rtlsdr_set_i2c_repeater) */
+	r = rtlsdr_write_array(dev, IICB, addr, buffer, len);
+	if (r < 0)
+		dev->i2c_repeater_on = 0;
+	return r;
 }
 
 int rtlsdr_i2c_read(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t *buffer, int len)
 {
 	uint16_t addr = i2c_addr;
+	int r;
 
 	if (!dev)
 		return -1;
 
-	return rtlsdr_read_array(dev, IICB, addr, buffer, len);
+	r = rtlsdr_read_array(dev, IICB, addr, buffer, len);
+	if (r < 0)
+		dev->i2c_repeater_on = 0;	/* as in rtlsdr_i2c_write */
+	return r;
 }
 
 uint16_t rtlsdr_read_reg(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint8_t len)
@@ -1152,10 +1193,36 @@ void rtlsdr_set_i2c_repeater(rtlsdr_dev_t *dev, int on)
 	 *	return;
 	 */
 
-	if (on != dev->i2c_repeater_on) {
-		dev->i2c_repeater_on = on;
-		rtlsdr_demod_write_reg(dev, 1, 0x01, on ? 0x18 : 0x10, 1);
+	/* The repeater stays on between tuner accesses (as the Linux kernel's
+	 * rtl2832 driver closes it lazily): switching it is a demod write + its
+	 * dummy read, 2 USB control transfers each way (~4 ms each on Windows) -
+	 * 4 more on every tuner call, where a retune of a drag makes 3 to 5.
+	 * The tuner (0x34) shares the I2C bus only with the EEPROM (0xa0).
+	 * i2c_repeater_on is set only once the write went through, and a demod
+	 * soft reset or a failed I2C transfer clears it, so it is switched on
+	 * again before the next tuner access. */
+	if (on && !dev->i2c_repeater_on) {
+		if (rtlsdr_demod_write_reg(dev, 1, 0x01, 0x18, 1) == 0)
+			dev->i2c_repeater_on = 1;
 	}
+#ifndef _WIN32
+	else if (on) {
+		/* already on: the demod read that followed the repeater write, so a
+		 * tuner access still starts after a control IN, as it always did.
+		 * An always-on repeater without one gave intermittent I2C failures
+		 * on retunes (Sultan Qasim Khan's rtl-sdr fast_retune, 3099626),
+		 * and the kernel's rtl2832 driver reads the repeater register before
+		 * every tuner message. Measured on a Raspberry Pi 5 (KrakenSDR):
+		 * without this read ~160-200 I2C writes failed (LIBUSB_ERROR_PIPE,
+		 * mostly 0x1a / 0x1b) in 20 minutes of drags, with it none.
+		 * A stalled control OUT is also retried after this same read on
+		 * every platform (rtlsdr_ctrl_transfer_retry): that covers a pause
+		 * inside a tuner access (>= 300 ms stalled the next write here),
+		 * this read the start of one. Windows has only the retry - a
+		 * transfer only when one is needed. */
+		rtlsdr_demod_read_reg(dev, 0x0a, 0x01, 1);
+	}
+#endif
 
 	if (!on)
 		pthread_mutex_unlock(&dev->cs_mutex);
@@ -1210,6 +1277,7 @@ void rtlsdr_init_baseband(rtlsdr_dev_t *dev)
 	/* reset demod (bit 3, soft_rst) */
 	rtlsdr_demod_write_reg(dev, 1, 0x01, 0x14, 1);
 	rtlsdr_demod_write_reg(dev, 1, 0x01, 0x10, 1);
+	dev->i2c_repeater_on = 0;	/* 0x10: the I2C repeater is off */
 
 	/* disable spectrum inversion and adjacent channel rejection */
 	rtlsdr_demod_write_reg(dev, 1, 0x15, 0x00, 1);
@@ -1641,6 +1709,64 @@ int rtlsdr_set_center_freq64(rtlsdr_dev_t *dev, uint64_t freq)
 	return r;
 }
 
+
+static int rtlsdr_fast_tune_applies(rtlsdr_dev_t *dev)
+{
+	/* R820T / R828D, no direct sampling (no automatic switching to it) */
+	return (dev->tuner_type == RTLSDR_TUNER_R820T || dev->tuner_type == RTLSDR_TUNER_R828D) &&
+		!dev->direct_sampling && dev->direct_sampling_mode <= RTLSDR_DS_Q;
+}
+
+int rtlsdr_set_center_freq_fast(rtlsdr_dev_t *dev, uint32_t freq, int flags)
+{
+	int r;
+
+	#ifdef _ENABLE_RPC
+	if (rtlsdr_rpc_is_enabled())
+	{
+	  return rtlsdr_rpc_set_center_freq(dev, freq);
+	}
+	#endif
+	if (!dev || !dev->tuner)
+		return -1;
+
+	flags &= RTLSDR_TUNE_KEEP_AUTOTUNE | RTLSDR_TUNE_SPAN_AUTOTUNE;
+	if (!flags || !rtlsdr_fast_tune_applies(dev))
+		return rtlsdr_set_center_freq(dev, freq);
+
+	pthread_mutex_lock(&dev->cs_mutex);	/* recursive: the tune takes it again */
+	dev->r82xx_p.tune_flags = (uint8_t)flags;
+	r = rtlsdr_set_center_freq(dev, freq);
+	dev->r82xx_p.tune_flags = 0;
+	pthread_mutex_unlock(&dev->cs_mutex);
+	return r;
+}
+
+int rtlsdr_finish_tune(rtlsdr_dev_t *dev)
+{
+	int r = 0;
+
+	#ifdef _ENABLE_RPC
+	if (rtlsdr_rpc_is_enabled())
+	{
+	  return 0;
+	}
+	#endif
+	if (!dev || !dev->tuner)
+		return -1;
+
+	pthread_mutex_lock(&dev->cs_mutex);	/* (no transfer when nothing is pending) */
+	/* the tuner in use: also in an automatic direct sampling mode above its
+	 * threshold (a drag before the mode switch may have left it pending) */
+	if ((dev->tuner_type == RTLSDR_TUNER_R820T || dev->tuner_type == RTLSDR_TUNER_R828D) &&
+	    !dev->direct_sampling && dev->r82xx_p.tune_pending) {
+		rtlsdr_set_i2c_repeater(dev, 1);
+		r = r82xx_finish_tune(&dev->r82xx_p);
+		rtlsdr_set_i2c_repeater(dev, 0);
+	}
+	pthread_mutex_unlock(&dev->cs_mutex);
+	return r;
+}
 
 int rtlsdr_is_tuner_PLL_locked(rtlsdr_dev_t *dev)
 {
@@ -2244,9 +2370,13 @@ int rtlsdr_set_sample_rate(rtlsdr_dev_t *dev, uint32_t samp_rate)
 
 	r |= rtlsdr_set_sample_freq_correction(dev, dev->corr);
 
-	/* reset demod (bit 3, soft_rst) */
+	/* reset demod (bit 3, soft_rst) - it switches the I2C repeater off too:
+	 * under cs_mutex, so no other thread's tuner access runs in between */
+	pthread_mutex_lock(&dev->cs_mutex);
 	r |= rtlsdr_demod_write_reg(dev, 1, 0x01, 0x14, 1);
 	r |= rtlsdr_demod_write_reg(dev, 1, 0x01, 0x10, 1);
+	dev->i2c_repeater_on = 0;	/* 0x10: the I2C repeater is off */
+	pthread_mutex_unlock(&dev->cs_mutex);
 
 	/* recalculate offset frequency if offset tuning is enabled */
 	if (dev->offs_freq)

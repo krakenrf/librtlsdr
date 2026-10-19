@@ -182,6 +182,46 @@ RTLSDR_API int rtlsdr_set_center_freq(rtlsdr_dev_t *dev, uint32_t freq);
  */
 RTLSDR_API int rtlsdr_set_center_freq64(rtlsdr_dev_t *dev, uint64_t freq);
 
+/* rtlsdr_set_center_freq_fast() flags */
+#define RTLSDR_TUNE_KEEP_AUTOTUNE	0x01
+#define RTLSDR_TUNE_SPAN_AUTOTUNE	0x04
+
+/*!
+ * Retune for a drag (a run of retunes close together): as
+ * rtlsdr_set_center_freq(), with less USB traffic. The PLL lock is still
+ * checked on every call. R820T / R828D without direct sampling; anywhere
+ * else the flags are ignored.
+ *  RTLSDR_TUNE_KEEP_AUTOTUNE: the PLL autotune clock stays at 128 kHz after
+ *    the lock (no autotune clock writes to register 0x1a while dragging; a
+ *    band change still writes its RF filter bits there). Call
+ *    rtlsdr_finish_tune() once the drag is over.
+ *  RTLSDR_TUNE_SPAN_AUTOTUNE: the 128 kHz clock goes out in the I2C write
+ *    of N / SDM (0x14..0x1a) instead of a write of its own before them.
+ * (0x02 is not used.) flags 0 = rtlsdr_set_center_freq().
+ *
+ * \param dev the device handle given by rtlsdr_open()
+ * \param frequency in Hz
+ * \param flags RTLSDR_TUNE_*
+ * \return 0 on success
+ * \return < 0 if device handle is invalid, the PLL didn't lock or some other error
+ */
+RTLSDR_API int rtlsdr_set_center_freq_fast(rtlsdr_dev_t *dev, uint32_t freq, int flags);
+
+/*!
+ * Ends a drag of rtlsdr_set_center_freq_fast() calls: reads the PLL lock,
+ * then sets the 8 kHz PLL autotune clock - the state rtlsdr_set_center_freq()
+ * leaves. No USB transfer when nothing is pending (any
+ * rtlsdr_set_center_freq() in between ends it too). Call it once the
+ * retunes have stopped for a while (e.g. 0.4 s), and before anything that
+ * relies on the state of a full tune (a calibration).
+ *
+ * \param dev the device handle given by rtlsdr_open()
+ * \return 0 done
+ * \return 1 PLL not locked: tune again with rtlsdr_set_center_freq()
+ * \return < 0 if device handle is invalid or some other error
+ */
+RTLSDR_API int rtlsdr_finish_tune(rtlsdr_dev_t *dev);
+
 /*!
  * Set harmonic reception - for R820T/2 tuner
  *

@@ -83,6 +83,11 @@ struct r82xx_priv {
 	struct r82xx_config		*cfg;
 
 	uint8_t						regs[NUM_REGS];
+	uint32_t					regs_unsynced;	/* bit n: the chip may not hold regs[n] */
+	int							mux_range;		/* freq_ranges[] index of the last r82xx_set_mux, -1 = none */
+	uint8_t						pll_settle;		/* next lock read waits R82XX_PLL_SETTLE_US (divider / band changed) */
+	uint8_t						tune_flags;		/* R82XX_TUNE_* of the rtlsdr_set_center_freq_fast() call running */
+	uint8_t						tune_pending;	/* PLL autotune clock (maybe) still at 128 kHz: r82xx_finish_tune() */
 	uint8_t						buf[NUM_REGS + 1];
 	uint8_t						override_data[NUM_REGS];
 	uint8_t						override_mask[NUM_REGS];
@@ -155,6 +160,10 @@ int r82xx_init(struct r82xx_priv *priv);
 int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq);
 int r82xx_set_freq64(struct r82xx_priv *priv, uint64_t freq);
 int r82xx_is_tuner_locked(struct r82xx_priv *priv);
+/* rtlsdr_set_center_freq_fast() flags (= RTLSDR_TUNE_* in rtl-sdr.h) */
+#define R82XX_TUNE_KEEP_AUTOTUNE	0x01
+#define R82XX_TUNE_SPAN_AUTOTUNE	0x04
+int r82xx_finish_tune(struct r82xx_priv *priv);
 int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain, int extended_mode, int lna_gain, int mixer_gain, int vga_gain, int *rtl_vga_control);
 int r82xx_get_rf_gain(struct r82xx_priv *priv);
 int r82xx_get_if_gain(struct r82xx_priv *priv);
