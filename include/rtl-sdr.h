@@ -632,8 +632,12 @@ RTLSDR_API int rtlsdr_read_async(rtlsdr_dev_t *dev,
 				 uint32_t buf_len);
 
 /*!
- * Map the transfer buffers for rtlsdr_read_async() now, ahead of the stream
- * start (Linux usbfs zero-copy builds only - ENABLE_ZEROCOPY). They are kept
+ * Use usbfs zero-copy transfer buffers on this handle and map them now, ahead
+ * of the stream start (Linux only; compiled in unless built with
+ * -DENABLE_ZEROCOPY=0). Without this call a handle streams into user-space
+ * buffers. The callback of rtlsdr_read_async() then gets pointers into the
+ * mapped buffers: copy them out in one go (memcpy) - on hosts that map them
+ * uncached (Raspberry Pi) byte-by-byte access is several times slower. They are kept
  * until rtlsdr_close() (or a read with another geometry), so starting a
  * stream only submits the transfers: mapping them on the start path takes
  * long enough for the RTL2832 FIFO to overflow, which skews the start of

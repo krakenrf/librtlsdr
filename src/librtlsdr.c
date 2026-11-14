@@ -215,10 +215,17 @@ static int rtlsdr_raw_io(libusb_device_handle *devh, uint32_t buf_len, int on)
 #define ENBALE_R820T_HARM_OPT	1
 #define ENABLE_VCO_OPTIONS		1
 
-/* usbfs zero-copy transfer buffers (Linux). Off since d8ececb ("sync errors",
- * cause not recorded); see the zero-copy investigation before enabling. */
+/* usbfs zero-copy transfer buffers (Linux). Compiled in by default
+ * (-DENABLE_ZEROCOPY=0 leaves them out), but used only on a handle whose
+ * application called rtlsdr_prealloc_async(): mapped inside
+ * rtlsdr_read_async() they delay the stream's first transfer - with several
+ * dongles started together the streams then start milliseconds apart (the
+ * "sync errors" they were switched off for in d8ececb) - and on hosts that
+ * map them uncached (Raspberry Pi) reading them byte by byte is several times
+ * slower than a user-space buffer, which an application has to know about.
+ * Without that call every stream uses user-space buffers, as before. */
 #ifndef ENABLE_ZEROCOPY
-#define ENABLE_ZEROCOPY 0
+#define ENABLE_ZEROCOPY 1
 #endif
 /* Linux zero-copy build: the buffers are mapped once per handle and kept
  * until rtlsdr_close (map once), see _rtlsdr_alloc_async_buffers(). Every
@@ -348,6 +355,8 @@ struct rtlsdr_dev {
 	uint32_t zc_buf_num;
 	uint32_t zc_buf_len;
 	int zc_inflight;
+	/* the application asked for zero-copy buffers (rtlsdr_prealloc_async) */
+	int zc_wanted;
 #endif
 	/* rtl demod context */
 	uint32_t rate; /* Hz */
@@ -4314,11 +4323,13 @@ static int _rtlsdr_alloc_async_buffers(rtlsdr_dev_t *dev)
 	dev->xfer_buf = malloc(dev->xfer_buf_num * sizeof(unsigned char *));
 	memset(dev->xfer_buf, 0, dev->xfer_buf_num * sizeof(unsigned char *));
 
-#if defined (__linux__) && LIBUSB_API_VERSION >= 0x01000105 && ENABLE_ZEROCOPY
-	fprintf(stderr, "Allocating %d zero-copy buffers\n", dev->xfer_buf_num);
+#if ZEROCOPY_BUILD
+	/* only for a handle that asked with rtlsdr_prealloc_async() */
+	dev->use_zerocopy = dev->zc_wanted;
+	if (dev->use_zerocopy)
+		fprintf(stderr, "Allocating %d zero-copy buffers\n", dev->xfer_buf_num);
 
-	dev->use_zerocopy = 1;
-	for (i = 0; i < dev->xfer_buf_num; ++i) {
+	for (i = 0; dev->zc_wanted && i < dev->xfer_buf_num; ++i) {
 		dev->xfer_buf[i] = libusb_dev_mem_alloc(dev->devh, dev->xfer_buf_len);
 
 		/* upstream f68bb2f: a kernel whose usbfs mmap() maps the wrong
@@ -4344,8 +4355,10 @@ static int _rtlsdr_alloc_async_buffers(rtlsdr_dev_t *dev)
 	}
 
 	/* zero-copy buffer allocation failed (partially or completely)
-	 * we need to free the buffers again if already allocated */
-	if (!dev->use_zerocopy) {
+	 * we need to free the buffers again if already allocated; the handle
+	 * stays on user-space buffers from here on */
+	if (dev->zc_wanted && !dev->use_zerocopy) {
+		dev->zc_wanted = 0;
 		for (i = 0; i < dev->xfer_buf_num; ++i) {
 			if (dev->xfer_buf[i])
 				libusb_dev_mem_free(dev->devh,
@@ -4675,6 +4688,7 @@ int rtlsdr_prealloc_async(rtlsdr_dev_t *dev, uint32_t buf_num, uint32_t buf_len)
 	dev->xfer_buf_num = buf_num > 0 ? buf_num : DEFAULT_BUF_NUMBER;
 	dev->xfer_buf_len = (buf_len > 0 && buf_len % 512 == 0) ? buf_len : DEFAULT_BUF_LENGTH;
 
+	dev->zc_wanted = 1;
 	if (_rtlsdr_alloc_async_buffers(dev) < 0) {
 		_rtlsdr_free_async_buffers(dev);
 		return -3;
