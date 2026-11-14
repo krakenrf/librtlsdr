@@ -552,6 +552,42 @@ RTLSDR_API int rtlsdr_set_dithering(rtlsdr_dev_t *dev, int dither);
 RTLSDR_API int rtlsdr_reset_buffer(rtlsdr_dev_t *dev);
 
 /*!
+ * Hold the USB FIFO empty, so that several devices' streams can be started
+ * together (rtlsdr_release_fifos). Held, the bulk endpoint delivers nothing:
+ * transfers submitted meanwhile - rtlsdr_read_async() - wait, and the stream
+ * starts at the release with an empty FIFO, at the sample of the release.
+ * Without it a stream starts at its first transfer, with up to ~3.7 KB of
+ * samples the FIFO kept from long before, then a gap. Call it in place of
+ * rtlsdr_reset_buffer() before rtlsdr_read_async(); unlike that reset it is
+ * safe while transfers are pending (the reset STALLs them: the stream dies).
+ *
+ * \param dev the device handle given by rtlsdr_open()
+ * \param hold 1 to empty and hold the FIFO, 0 to release it (synchronously)
+ * \return 0 on success, -1 on error
+ */
+#define RTLSDR_HAS_FIFO_HOLD 1
+RTLSDR_API int rtlsdr_set_fifo_hold(rtlsdr_dev_t *dev, int hold);
+
+/*!
+ * Start several devices' streams together: wait (at most timeout_ms) until
+ * each device's rtlsdr_read_async(), running in its own thread, has
+ * submitted its transfers, then release their FIFOs (held with
+ * rtlsdr_set_fifo_hold()) with asynchronous control transfers submitted back
+ * to back, and wait until those completed (each on its stream's event loop).
+ * A release not confirmed is repeated synchronously - no FIFO stays held.
+ *
+ * \param devs device handles, NULL entries are skipped
+ * \param n number of entries
+ * \param timeout_ms how long to wait for the streams to be submitted
+ * \param done_us NULL, or n entries: when each release completed, in us
+ *  after the first was submitted (-1: not confirmed, released synchronously
+ *  afterwards) - their spread is about how far apart the streams started
+ * \return 0 all released together, 1 released, but a stream was not yet
+ *  submitted (it started late or not at all), < 0 error (-2: a release failed)
+ */
+RTLSDR_API int rtlsdr_release_fifos(rtlsdr_dev_t **devs, int n, int timeout_ms, int *done_us);
+
+/*!
  * Read data synchronously
  *
  * \param dev the device handle given by rtlsdr_open()
@@ -594,6 +630,23 @@ RTLSDR_API int rtlsdr_read_async(rtlsdr_dev_t *dev,
 				 void *ctx,
 				 uint32_t buf_num,
 				 uint32_t buf_len);
+
+/*!
+ * Map the transfer buffers for rtlsdr_read_async() now, ahead of the stream
+ * start (Linux usbfs zero-copy builds only - ENABLE_ZEROCOPY). They are kept
+ * until rtlsdr_close() (or a read with another geometry), so starting a
+ * stream only submits the transfers: mapping them on the start path takes
+ * long enough for the RTL2832 FIFO to overflow, which skews the start of
+ * this device against others started at the same time.
+ *
+ * \param dev the device handle given by rtlsdr_open()
+ * \param buf_num and buf_len as for rtlsdr_read_async() (0 = default)
+ * \return 0 zero-copy buffers mapped and kept, 1 nothing done (no zero-copy
+ *  in this build, or it fell back to user-space buffers, which stay per
+ *  stream), < 0 error (-2: a stream is running)
+ */
+#define RTLSDR_HAS_PREALLOC_ASYNC 1
+RTLSDR_API int rtlsdr_prealloc_async(rtlsdr_dev_t *dev, uint32_t buf_num, uint32_t buf_len);
 
 /*!
  * Cancel all pending asynchronous operations on the device.
