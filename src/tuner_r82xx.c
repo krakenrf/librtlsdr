@@ -65,6 +65,33 @@
  * (same divider, same band) don't wait. */
 #define R82XX_PLL_SETTLE_US	5000
 
+/* ... and after a tune that moved the VCO by more than this within one
+ * divider and band. Measured on the KrakenSDR (2026-11-21, random
+ * frequencies 24-1766 MHz, 5 dongles): without it 3.3-3.5 % of all tunes
+ * read the lock before the PLL had settled (a lock retry; 1-4 left 0x0b =
+ * 0xff, some 0x1b / 0x1c corrupted - the stream ~30 dB weaker), every one
+ * a jump of more than 400 MHz (VCO > 800 MHz) in the top divider (RF
+ * 885-1766 MHz, all one band, so no settle); 0 retries in 4597 same-divider
+ * jumps of less than 400 MHz (any divider; 790 of 300-400 MHz in the top
+ * one, VCO 600-800 MHz). 400 MHz of VCO = half of that: a
+ * sweep's hops (2.4 MHz RF, at most 154 MHz VCO at 24 MHz) never wait. */
+#define R82XX_PLL_SETTLE_VCO_JUMP_KHZ	400000
+
+/* The PLL lock check (r82xx_set_pll, r82xx_set_pll_yc, r82xx_finish_tune)
+ * reads registers 0..3; the lock bit is in register 2. It read 0..2 (as
+ * osmocom does), but every USB control IN of 3 bytes makes the RTL2832U
+ * drop 4 bytes - 2 I/Q samples - from its running stream, so each tune
+ * moved that dongle's samples against the other dongles'
+ * (rtlsdr_ctrl_transfer_retry in librtlsdr.c, RTLSDR_NO_STREAM_SLIP). 4,
+ * not 5: a lock read that comes before the PLL has settled (the settle
+ * wait above too short - provoked with it at 0 / 1500 us) can leave 0x0b
+ * (4 or 5 bytes read) and 0x0c (5) at 0xff on the chip - never seen with
+ * 3 - and 0x1b / 0x1c corrupted (any length, 3 too: the stream ~30 dB
+ * weaker until they are rewritten); with the 5000 us wait no lock read came
+ * early in 2026-11-21's KrakenSDR runs (docs/dev/librtlsdr-fork.md of the
+ * KrakenSDR suite). */
+#define R82XX_LOCK_READ_LEN	4
+
 #ifdef _WIN32
 #include <windows.h>
 static void r82xx_settle_wait(unsigned int us)
@@ -1000,10 +1027,10 @@ static int r82xx_set_pll_yc(struct r82xx_priv *priv, uint32_t freq)
 /***/
 
   /* Check if PLL has locked */
-  rc = r82xx_read(priv, 0x00, data, 3);
+  rc = r82xx_read(priv, 0x00, data, R82XX_LOCK_READ_LEN);
   if (rc < 0) {
       if (priv->cfg->verbose)
-        fprintf(stderr, "r82xx_set_pll_yc(): error reading 'pll lock status' from i2c reg 0x00..0x02\n");
+        fprintf(stderr, "r82xx_set_pll_yc(): error reading 'pll lock status' from i2c reg 0x00..0x03\n");
     return rc;
   }
   if (!(data[2] & 0x40)) {
@@ -1155,6 +1182,17 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 
 	vco_freq = (uint64_t)freq * (uint64_t)mix_div;
 
+	/* a big VCO jump inside one divider and band waits before the lock read
+	 * too (R82XX_PLL_SETTLE_VCO_JUMP_KHZ) */
+	{
+		uint32_t vco_khz = (uint32_t)(vco_freq / 1000);
+		uint32_t jump = vco_khz > priv->last_vco_khz ? vco_khz - priv->last_vco_khz : priv->last_vco_khz - vco_khz;
+
+		if (!priv->last_vco_khz || jump > R82XX_PLL_SETTLE_VCO_JUMP_KHZ)
+			priv->pll_settle = 1;
+		priv->last_vco_khz = vco_khz;
+	}
+
 	/*
 	 * We want to approximate:
 	 *
@@ -1249,13 +1287,12 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 
 	for (i = 0; i < 2; i++) {
 
-		/* Check if PLL has locked - registers 0..2 only, as osmocom: reading
-		 * 3 / 4 too while the PLL settled after a divider change was
-		 * followed by the 0x0b / 0x0c corruption (see R82XX_PLL_SETTLE_US) */
-		rc = r82xx_read(priv, 0x00, data, 3);
+		/* Check if PLL has locked - registers 0..3 (R82XX_LOCK_READ_LEN:
+		 * a 3-byte read drops 2 samples of the stream) */
+		rc = r82xx_read(priv, 0x00, data, R82XX_LOCK_READ_LEN);
 		if (rc < 0) {
 			if (priv->cfg->verbose)
-				fprintf(stderr, "r82xx_set_pll(): error reading 'pll lock status' from i2c reg 0x00 .. 0x02\n");
+				fprintf(stderr, "r82xx_set_pll(): error reading 'pll lock status' from i2c reg 0x00 .. 0x03\n");
 			return rc;
 		}
 		if ( (data[2] & 0x40) || vco_curr_max == vco_curr_min )
@@ -1312,7 +1349,7 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
  * the full path), < 0 = I2C error */
 int r82xx_finish_tune(struct r82xx_priv *priv)
 {
-	uint8_t data[3];
+	uint8_t data[R82XX_LOCK_READ_LEN];
 	int rc;
 
 	if (!priv->tune_pending)

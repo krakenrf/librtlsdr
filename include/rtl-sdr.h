@@ -185,6 +185,7 @@ RTLSDR_API int rtlsdr_set_center_freq64(rtlsdr_dev_t *dev, uint64_t freq);
 /* rtlsdr_set_center_freq_fast() flags */
 #define RTLSDR_TUNE_KEEP_AUTOTUNE	0x01
 #define RTLSDR_TUNE_SPAN_AUTOTUNE	0x04
+#define RTLSDR_TUNE_NO_DUMMY_READ	0x08
 
 /*!
  * Retune for a drag (a run of retunes close together): as
@@ -197,6 +198,13 @@ RTLSDR_API int rtlsdr_set_center_freq64(rtlsdr_dev_t *dev, uint64_t freq);
  *    rtlsdr_finish_tune() once the drag is over.
  *  RTLSDR_TUNE_SPAN_AUTOTUNE: the 128 kHz clock goes out in the I2C write
  *    of N / SDM (0x14..0x1a) instead of a write of its own before them.
+ *  RTLSDR_TUNE_NO_DUMMY_READ (any tuner): outside Windows every tuner access
+ *    starts with a dummy demod read, so that no control OUT comes first after
+ *    a quiet spell (it stalls); with this flag that read is made only if the
+ *    tune's first I2C transfer is a write - a tune that starts with a tuner
+ *    read (a same-band step with KEEP_AUTOTUNE: the register-4 read) has
+ *    its control IN in front already: 1 USB transfer less (Windows makes no
+ *    dummy read anyway).
  * (0x02 is not used.) flags 0 = rtlsdr_set_center_freq().
  *
  * \param dev the device handle given by rtlsdr_open()
@@ -221,6 +229,24 @@ RTLSDR_API int rtlsdr_set_center_freq_fast(rtlsdr_dev_t *dev, uint32_t freq, int
  * \return < 0 if device handle is invalid or some other error
  */
 RTLSDR_API int rtlsdr_finish_tune(rtlsdr_dev_t *dev);
+
+/*
+ * Defined when no USB control transfer of this library drops samples from a
+ * running stream (rtlsdr_read_async / rtlsdr_read_sync): a retune
+ * (rtlsdr_set_center_freq, _fast, rtlsdr_finish_tune), a gain or IF mode
+ * change, a GPIO / bias tee write or a register read leaves the stream's
+ * sample count intact, so dongles streaming together stay in step whatever
+ * each is told. Measured on a KrakenSDR (five R820T): the RTL2832U drops 4
+ * bytes (2 I/Q samples) of its bulk stream for every USB control IN whose
+ * data stage is 3, 7, 11 ... bytes long - the R820T's PLL lock check (a
+ * read of 3 tuner registers on every tune) shifted a retuned dongle's
+ * stream by 2 samples a tune against the others. This library makes no IN
+ * of such a length (librtlsdr.c, rtlsdr_ctrl_transfer_retry). What moves a
+ * stream on purpose: rtlsdr_set_sample_freq_correction* (the sample clock);
+ * not measured: the calls that reset the demodulator (sample rate, direct
+ * sampling, test / AGC modes) and rtlsdr_reset_buffer while streaming.
+ */
+#define RTLSDR_NO_STREAM_SLIP 1
 
 /*!
  * Set harmonic reception - for R820T/2 tuner

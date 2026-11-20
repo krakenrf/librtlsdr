@@ -89,13 +89,42 @@ typedef int socklen_t;
  * open: 4 stalls per dongle with an R820T - on Linux now 6 more writes and
  * 6 more dummy reads per dongle, measured on the Pi 5; a busy EEPROM, not
  * measured): it is
- * retried and, if it persists, returned unchanged. */
+ * retried and, if it persists, returned unchanged.
+ *
+ * And no control IN has a data stage of 3, 7, 11 ... bytes (length % 4 ==
+ * 3): each such transfer makes the RTL2832U drop 4 bytes - 2 I/Q samples -
+ * from its running bulk stream, so that dongle's samples shift against every
+ * other's (RTLSDR_NO_STREAM_SLIP in rtl-sdr.h). Measured on a KrakenSDR
+ * (2026-11-21, x86_64 Linux, three dongles streaming, the lag of the
+ * operated one against the others by cross-correlation, 100 transfers each):
+ * -2.000 samples per transfer for lengths 3, 7, 11, 15, 19, 23, 27, 31, 35,
+ * 63 - any vendor block (USB, SYS, demod, I2C to the tuner or the EEPROM)
+ * and the standard GET_DESCRIPTOR alike, also at 1.2 MS/s (a byte count, not
+ * time); 0.000 for 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 64, for every
+ * write, and for a read that failed (no data stage). Such a read is made one
+ * byte longer into a bounce buffer and the caller gets its own bytes: the
+ * one more register (or tuner / EEPROM byte) read has no effect - none of
+ * the library's reads is of a register that changes when read. (The R820T
+ * PLL lock check read 3 tuner registers on every tune: 2 samples a tune.) */
+#define RTLSDR_CTRL_IN_PAD_MAX	255
 static int rtlsdr_ctrl_transfer_retry(libusb_device_handle *devh, uint8_t request_type,
 	uint8_t request, uint16_t value, uint16_t index, unsigned char *data, uint16_t length,
 	unsigned int timeout)
 {
-	int r = libusb_control_transfer(devh, request_type, request, value, index, data, length, timeout);
-	int i;
+	int r, i;
+
+	if ((request_type & LIBUSB_ENDPOINT_IN) && (length & 3) == 3 && length <= RTLSDR_CTRL_IN_PAD_MAX) {
+		unsigned char bounce[RTLSDR_CTRL_IN_PAD_MAX + 1];
+
+		r = libusb_control_transfer(devh, request_type, request, value, index, bounce, length + 1, timeout);
+		if (r > (int)length)
+			r = length;
+		if (r > 0)
+			memcpy(data, bounce, r);
+		return r;	/* (an IN is never retried) */
+	}
+
+	r = libusb_control_transfer(devh, request_type, request, value, index, data, length, timeout);
 	for (i = 0; i < 3 && r == LIBUSB_ERROR_PIPE && !(request_type & LIBUSB_ENDPOINT_IN); i++) {
 		unsigned char dummy[2];
 		libusb_control_transfer(devh, LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_IN, 0,
@@ -429,12 +458,18 @@ struct rtlsdr_dev {
 	volatile LONG xfer_inflight;
 #endif
 	int i2c_repeater_on;
+	/* RTLSDR_TUNE_NO_DUMMY_READ (rtlsdr_set_i2c_repeater): the tune running
+	 * leaves the dummy demod read to its first I2C write (i2c_in_due), and
+	 * none is made if a tuner read comes first */
+	int i2c_in_lazy;
+	int i2c_in_due;
 	int rc_active;
 	int verbose;
 	int dev_num;
 };
 
 static int rtlsdr_demod_write_reg(rtlsdr_dev_t *dev, uint8_t page, uint16_t addr, uint16_t val, uint8_t len);
+uint16_t rtlsdr_demod_read_reg(rtlsdr_dev_t *dev, uint8_t page, uint16_t addr, uint8_t len);
 static int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq);
 static int rtlsdr_update_ds(rtlsdr_dev_t *dev, uint64_t freq);
 static int rtlsdr_set_spectrum_inversion(rtlsdr_dev_t *dev, int sideband);
@@ -1018,6 +1053,12 @@ int rtlsdr_i2c_write(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t *buffer, int l
 	if (!dev)
 		return -1;
 
+	/* the dummy read RTLSDR_TUNE_NO_DUMMY_READ left to the first write */
+	if (dev->i2c_in_due) {
+		dev->i2c_in_due = 0;
+		rtlsdr_demod_read_reg(dev, 0x0a, 0x01, 1);
+	}
+
 	/* failed: the next tuner access writes the I2C repeater on again
 	 * (it stays on between accesses - rtlsdr_set_i2c_repeater) */
 	r = rtlsdr_write_array(dev, IICB, addr, buffer, len);
@@ -1034,6 +1075,7 @@ int rtlsdr_i2c_read(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t *buffer, int le
 	if (!dev)
 		return -1;
 
+	dev->i2c_in_due = 0;	/* this read is the control IN in front */
 	r = rtlsdr_read_array(dev, IICB, addr, buffer, len);
 	if (r < 0)
 		dev->i2c_repeater_on = 0;	/* as in rtlsdr_i2c_write */
@@ -1253,13 +1295,23 @@ void rtlsdr_set_i2c_repeater(rtlsdr_dev_t *dev, int on)
 		 * every platform (rtlsdr_ctrl_transfer_retry): that covers a pause
 		 * inside a tuner access (>= 300 ms stalled the next write here),
 		 * this read the start of one. Windows has only the retry - a
-		 * transfer only when one is needed. */
-		rtlsdr_demod_read_reg(dev, 0x0a, 0x01, 1);
+		 * transfer only when one is needed.
+		 * RTLSDR_TUNE_NO_DUMMY_READ: what matters is a control IN before
+		 * the access's first control OUT, and a tuner read is one - the
+		 * read is made only if an I2C write comes first (rtlsdr_i2c_write),
+		 * so a sweep's same-band hop, which starts with the register-4
+		 * read, makes one transfer less. */
+		if (dev->i2c_in_lazy)
+			dev->i2c_in_due = 1;
+		else
+			rtlsdr_demod_read_reg(dev, 0x0a, 0x01, 1);
 	}
 #endif
 
-	if (!on)
+	if (!on) {
+		dev->i2c_in_due = 0;
 		pthread_mutex_unlock(&dev->cs_mutex);
+	}
 }
 
 int rtlsdr_set_fir(rtlsdr_dev_t *dev)
@@ -1764,13 +1816,17 @@ int rtlsdr_set_center_freq_fast(rtlsdr_dev_t *dev, uint32_t freq, int flags)
 	if (!dev || !dev->tuner)
 		return -1;
 
-	flags &= RTLSDR_TUNE_KEEP_AUTOTUNE | RTLSDR_TUNE_SPAN_AUTOTUNE;
-	if (!flags || !rtlsdr_fast_tune_applies(dev))
+	flags &= RTLSDR_TUNE_KEEP_AUTOTUNE | RTLSDR_TUNE_SPAN_AUTOTUNE | RTLSDR_TUNE_NO_DUMMY_READ;
+	if (!rtlsdr_fast_tune_applies(dev))
+		flags &= RTLSDR_TUNE_NO_DUMMY_READ;
+	if (!flags)
 		return rtlsdr_set_center_freq(dev, freq);
 
 	pthread_mutex_lock(&dev->cs_mutex);	/* recursive: the tune takes it again */
-	dev->r82xx_p.tune_flags = (uint8_t)flags;
+	dev->r82xx_p.tune_flags = (uint8_t)(flags & (RTLSDR_TUNE_KEEP_AUTOTUNE | RTLSDR_TUNE_SPAN_AUTOTUNE));
+	dev->i2c_in_lazy = (flags & RTLSDR_TUNE_NO_DUMMY_READ) != 0;
 	r = rtlsdr_set_center_freq(dev, freq);
+	dev->i2c_in_lazy = 0;
 	dev->r82xx_p.tune_flags = 0;
 	pthread_mutex_unlock(&dev->cs_mutex);
 	return r;
