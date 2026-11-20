@@ -204,7 +204,11 @@ RTLSDR_API int rtlsdr_set_center_freq64(rtlsdr_dev_t *dev, uint64_t freq);
  *    tune's first I2C transfer is a write - a tune that starts with a tuner
  *    read (a same-band step with KEEP_AUTOTUNE: the register-4 read) has
  *    its control IN in front already: 1 USB transfer less (Windows makes no
- *    dummy read anyway).
+ *    dummy read anyway). Should that first read fail, the dummy read is
+ *    made and the read tried once more. The stall the dummy read guards
+ *    against was found on a Raspberry Pi 5; the flag was measured only on
+ *    an x86_64 PC, where no stall was ever seen with or without it - there
+ *    is no positive control for it yet.
  * (0x02 is not used.) flags 0 = rtlsdr_set_center_freq().
  *
  * \param dev the device handle given by rtlsdr_open()
@@ -231,20 +235,26 @@ RTLSDR_API int rtlsdr_set_center_freq_fast(rtlsdr_dev_t *dev, uint32_t freq, int
 RTLSDR_API int rtlsdr_finish_tune(rtlsdr_dev_t *dev);
 
 /*
- * Defined when no USB control transfer of this library drops samples from a
- * running stream (rtlsdr_read_async / rtlsdr_read_sync): a retune
- * (rtlsdr_set_center_freq, _fast, rtlsdr_finish_tune), a gain or IF mode
- * change, a GPIO / bias tee write or a register read leaves the stream's
- * sample count intact, so dongles streaming together stay in step whatever
- * each is told. Measured on a KrakenSDR (five R820T): the RTL2832U drops 4
- * bytes (2 I/Q samples) of its bulk stream for every USB control IN whose
- * data stage is 3, 7, 11 ... bytes long - the R820T's PLL lock check (a
- * read of 3 tuner registers on every tune) shifted a retuned dongle's
- * stream by 2 samples a tune against the others. This library makes no IN
- * of such a length (librtlsdr.c, rtlsdr_ctrl_transfer_retry). What moves a
- * stream on purpose: rtlsdr_set_sample_freq_correction* (the sample clock);
- * not measured: the calls that reset the demodulator (sample rate, direct
- * sampling, test / AGC modes) and rtlsdr_reset_buffer while streaming.
+ * Defined when no tune drops samples from a running stream
+ * (rtlsdr_read_async / rtlsdr_read_sync), so dongles streaming together stay
+ * in step however differently each one is retuned. Exactly what holds:
+ * rtlsdr_set_center_freq, rtlsdr_set_center_freq_fast, rtlsdr_finish_tune,
+ * the gain, gain mode, IF mode and AGC calls, the GPIO / bias tee calls,
+ * rtlsdr_is_tuner_PLL_locked, rtlsdr_get_tuner_i2c_register and every other
+ * control transfer this library makes itself leave the stream's sample
+ * count intact. Outside the promise: rtlsdr_reset_buffer,
+ * rtlsdr_set_sample_rate (a demodulator soft reset), direct-sampling and
+ * offset-tuning changes reconfigure the stream; the sample-clock calls
+ * (rtlsdr_set_sample_freq_correction*) move it on purpose.
+ * The rule, measured on a KrakenSDR (five R820T): the RTL2832U drops 4 bytes
+ * (2 I/Q samples) of its bulk stream for every USB control IN whose data
+ * stage - the bytes the device actually sends back - is 3, 7, 11 ... bytes
+ * long. The R820T's PLL lock check read 3 tuner registers on every tune.
+ * The library's own control INs are made one byte longer where needed
+ * (librtlsdr.c, rtlsdr_ctrl_transfer_retry): its register reads return
+ * exactly what is asked. libusb's string-descriptor reads (the
+ * rtlsdr_get_*usb_strings calls) ask for 255 bytes and get the descriptor's
+ * even length (measured: no drop).
  */
 #define RTLSDR_NO_STREAM_SLIP 1
 

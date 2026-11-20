@@ -87,6 +87,7 @@ struct r82xx_priv {
 	int							mux_range;		/* freq_ranges[] index of the last r82xx_set_mux, -1 = none */
 	uint8_t						pll_settle;		/* next lock read waits R82XX_PLL_SETTLE_US (divider / band changed, a big VCO jump) */
 	uint32_t					last_vco_khz;	/* VCO of the last tune (0 = none): R82XX_PLL_SETTLE_VCO_JUMP_KHZ */
+	unsigned int				early_read_repairs;	/* r82xx_repair_early_read() calls (a count for tests) */
 	uint8_t						tune_flags;		/* R82XX_TUNE_* of the rtlsdr_set_center_freq_fast() call running */
 	uint8_t						tune_pending;	/* PLL autotune clock (maybe) still at 128 kHz: r82xx_finish_tune() */
 	uint8_t						buf[NUM_REGS + 1];

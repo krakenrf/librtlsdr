@@ -65,16 +65,23 @@
  * (same divider, same band) don't wait. */
 #define R82XX_PLL_SETTLE_US	5000
 
-/* ... and after a tune that moved the VCO by more than this within one
- * divider and band. Measured on the KrakenSDR (2026-11-21, random
- * frequencies 24-1766 MHz, 5 dongles): without it 3.3-3.5 % of all tunes
- * read the lock before the PLL had settled (a lock retry; 1-4 left 0x0b =
- * 0xff, some 0x1b / 0x1c corrupted - the stream ~30 dB weaker), every one
- * a jump of more than 400 MHz (VCO > 800 MHz) in the top divider (RF
- * 885-1766 MHz, all one band, so no settle); 0 retries in 4597 same-divider
- * jumps of less than 400 MHz (any divider; 790 of 300-400 MHz in the top
- * one, VCO 600-800 MHz). 400 MHz of VCO = half of that: a
- * sweep's hops (2.4 MHz RF, at most 154 MHz VCO at 24 MHz) never wait. */
+/* ... and after a tune that moved the VCO by more than this (400 MHz of
+ * VCO) within one divider and band. Measured on the KrakenSDR (2026-11-21,
+ * random frequencies 24-1766 MHz, 5 dongles): without it 3.3-3.5 % of all
+ * tunes read the lock before the PLL had settled (a lock retry; 1-4 left
+ * 0x0b = 0xff, some 0x1b / 0x1c corrupted - the stream ~30 dB weaker),
+ * every one a jump of more than 400 MHz of RF (= 800 MHz of VCO) in the
+ * top divider (mix_div 2, RF 885-1766 MHz, all one band, so no settle); 0
+ * retries in 4597 same-divider jumps of less than 400 MHz of RF (790 of
+ * 300-400 MHz in the top divider, VCO 600-800 MHz). The threshold, 400 MHz
+ * of VCO, is half the smallest VCO jump seen to need it. Measured only in
+ * the top divider; in the others it is margin - there it makes these tunes
+ * wait (same divider and band, LO jump > 400 MHz / mix_div): mix_div 64
+ * (LO 27.7-55 MHz) > 6.25 MHz within LO 27.7-50, 32 none (its bands are <=
+ * 10 MHz wide), 16 > 25 MHz inside 140-180 / 180-220, 8 > 50 MHz inside
+ * 310-442, 4 > 100 MHz inside 450-588 / 650-885, 2 > 200 MHz. A sweep's
+ * hops (2.4 MHz, at most 154 MHz of VCO at 24 MHz) and drag steps never
+ * wait. */
 #define R82XX_PLL_SETTLE_VCO_JUMP_KHZ	400000
 
 /* The PLL lock check (r82xx_set_pll, r82xx_set_pll_yc, r82xx_finish_tune)
@@ -89,7 +96,8 @@
  * 3 - and 0x1b / 0x1c corrupted (any length, 3 too: the stream ~30 dB
  * weaker until they are rewritten); with the 5000 us wait no lock read came
  * early in 2026-11-21's KrakenSDR runs (docs/dev/librtlsdr-fork.md of the
- * KrakenSDR suite). */
+ * KrakenSDR suite), and should one still, r82xx_repair_early_read() puts
+ * those registers back. */
 #define R82XX_LOCK_READ_LEN	4
 
 #ifdef _WIN32
@@ -901,7 +909,39 @@ static int r82xx_set_mux(struct r82xx_priv *priv, uint64_t freq)
 }
 
 
-/* function of Youssef (AirSpy) and Carl (RTL-SDR) */
+/* A lock read that came before the PLL settled (a lock retry; provoked with
+ * the settle wait shortened - docs/dev/librtlsdr-fork.md of the KrakenSDR
+ * suite) can leave tuner registers corrupted while the cache holds the
+ * right values, so nothing would ever rewrite them: 0x0b / 0x0c = 0xff (IF
+ * VGA at maximum, +13 dB), 0x1b / 0x1c (~-30 dB), and - for I2C writes made
+ * straight after such a read - 0x0d-0x0f and 0x19. So after a retry, and
+ * when the finish finds no lock, this waits R82XX_PLL_SETTLE_US, so that its
+ * own writes don't meet an unsettled PLL, then writes 0x0b-0x0f and
+ * 0x1b-0x1f back from the cache (2 I2C writes; registers never seen hit go
+ * out with their same values). Measured with the settle wait at 0 (2261
+ * retried tunes in 5 min): 0 tunes left with a register off the cache (17
+ * without the repair). Not covered: early reads that already saw the lock
+ * (no retry) - they hit 0x1b / 0x1c 5 times in the same run; repairing
+ * after every settle-point tune instead removed those but left 6 dongles
+ * with the PLL unlocked at rest and cost ~12 ms per settle point, so it
+ * isn't done. With the 5000 us settle neither case was ever seen.
+ * (0x17-0x1a are not rewritten: a build that did had more level drops, put
+ * right only by rewriting PLL registers.) */
+static void r82xx_repair_early_read(struct r82xx_priv *priv)
+{
+	uint8_t v[5];
+
+	r82xx_settle_wait(R82XX_PLL_SETTLE_US);
+	memcpy(v, &priv->regs[0x0b - REG_SHADOW_START], 5);
+	r82xx_write_arr(priv, 0x0b, v, 5);
+	memcpy(v, &priv->regs[0x1b - REG_SHADOW_START], 5);
+	r82xx_write_arr(priv, 0x1b, v, 5);
+	priv->early_read_repairs++;
+}
+
+/* function of Youssef (AirSpy) and Carl (RTL-SDR) - vco_algo 2 only, which
+ * nothing sets (the vcoalgo= option writes vco_curr_max): not in use, no
+ * settle wait */
 static int r82xx_set_pll_yc(struct r82xx_priv *priv, uint32_t freq)
 {
   const uint32_t vco_min = 1770000000;
@@ -1051,7 +1091,7 @@ static int r82xx_set_pll_yc(struct r82xx_priv *priv, uint32_t freq)
 static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 {
 	/* freq == tuner's LO frequency */
-	int rc, i;
+	int rc, i, early = 0;
 	uint64_t vco_freq;
 	uint64_t vco_div;
 	uint32_t vco_min = 1770000; /* kHz */
@@ -1299,7 +1339,9 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 			break;
 
 		if (!i) {
-			/* Didn't lock. Increase VCO current */
+			/* Didn't lock: this read came early */
+			early = 1;
+			/* Increase VCO current */
 			if (priv->last_vco_curr != vco_curr_max) {
 				rc = r82xx_write_reg_mask(priv, 0x12, vco_curr_max, 0xe0);
 				if (rc < 0) {
@@ -1311,6 +1353,11 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 			}
 		}
 	}
+
+	/* a lock read came before the PLL had settled (a retry): put back the
+	 * registers such a read can corrupt (r82xx_repair_early_read) */
+	if (early)
+		r82xx_repair_early_read(priv);
 
 	if (!(data[2] & 0x40)) {
 		if (priv->cfg->verbose || PRINT_PLL_ERRORS)
@@ -1361,6 +1408,8 @@ int r82xx_finish_tune(struct r82xx_priv *priv)
 	if (rc < 0)
 		return rc;
 	if (!(data[2] & 0x40)) {
+		/* not locked: this read may have met an unsettled PLL too */
+		r82xx_repair_early_read(priv);
 		if (priv->cfg->verbose || PRINT_PLL_ERRORS)
 			fprintf(stderr, "[R82XX] PLL not locked at the end of a drag (RF %f MHz)!\n",
 				priv->rf_freq * 1E-6);

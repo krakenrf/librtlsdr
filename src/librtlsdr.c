@@ -101,11 +101,17 @@ typedef int socklen_t;
  * 63 - any vendor block (USB, SYS, demod, I2C to the tuner or the EEPROM)
  * and the standard GET_DESCRIPTOR alike, also at 1.2 MS/s (a byte count, not
  * time); 0.000 for 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 64, for every
- * write, and for a read that failed (no data stage). Such a read is made one
- * byte longer into a bounce buffer and the caller gets its own bytes: the
- * one more register (or tuner / EEPROM byte) read has no effect - none of
- * the library's reads is of a register that changes when read. (The R820T
- * PLL lock check read 3 tuner registers on every tune: 2 samples a tune.) */
+ * write, and for a read that failed (no data stage). What counts is the
+ * data stage actually transferred: the RTL2832U's vendor reads return
+ * exactly wLength bytes, so such a read is made one byte longer (wLength
+ * % 4 == 0) into a bounce buffer and the caller gets its own bytes. The one
+ * more byte read has no effect: R820T registers 0..4 are read-only status,
+ * the demod / USB / SYS registers the library reads don't change when read,
+ * EEPROM reads are 1 byte, and rtlsdr_ir_query's IR_RX_BUF is code RAM
+ * (0xFC00..) that the query clears right after the read. Standard requests
+ * made by libusb itself (string descriptors, wLength 255) return the
+ * descriptor's own, even, length. (The R820T PLL lock check read 3 tuner
+ * registers on every tune: 2 samples a tune.) */
 #define RTLSDR_CTRL_IN_PAD_MAX	255
 static int rtlsdr_ctrl_transfer_retry(libusb_device_handle *devh, uint8_t request_type,
 	uint8_t request, uint16_t value, uint16_t index, unsigned char *data, uint16_t length,
@@ -463,6 +469,7 @@ struct rtlsdr_dev {
 	 * none is made if a tuner read comes first */
 	int i2c_in_lazy;
 	int i2c_in_due;
+	unsigned int i2c_in_lazy_retries;	/* first reads that failed under it and were retried (a count for tests) */
 	int rc_active;
 	int verbose;
 	int dev_num;
@@ -1070,13 +1077,22 @@ int rtlsdr_i2c_write(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t *buffer, int l
 int rtlsdr_i2c_read(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t *buffer, int len)
 {
 	uint16_t addr = i2c_addr;
-	int r;
+	int r, due;
 
 	if (!dev)
 		return -1;
 
+	due = dev->i2c_in_due;
 	dev->i2c_in_due = 0;	/* this read is the control IN in front */
 	r = rtlsdr_read_array(dev, IICB, addr, buffer, len);
+	if (r < 0 && due) {
+		/* RTLSDR_TUNE_NO_DUMMY_READ: the access's first transfer failed -
+		 * make the dummy read it left out and try once more (an IN is
+		 * never retried in rtlsdr_ctrl_transfer_retry) */
+		dev->i2c_in_lazy_retries++;
+		rtlsdr_demod_read_reg(dev, 0x0a, 0x01, 1);
+		r = rtlsdr_read_array(dev, IICB, addr, buffer, len);
+	}
 	if (r < 0)
 		dev->i2c_repeater_on = 0;	/* as in rtlsdr_i2c_write */
 	return r;
