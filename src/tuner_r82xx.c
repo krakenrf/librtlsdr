@@ -1767,6 +1767,48 @@ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain,
 	return rc;
 }
 
+/* rtlsdr_set_tuner_gain_fast() / rtlsdr_set_center_freq_gain_fast(): the
+ * manual gain r82xx_set_gain(priv, 1, gain, ...) sets - the same table and
+ * rounding (r82xx_get_rf_gain_index), the same cache and last_* values, the
+ * IF VGA left as it is - without that call's read of registers 0..3 (its
+ * result is not used) and with the LNA (0x05) and mixer (0x07) gains in ONE
+ * I2C write of 0x05..0x07 when both change (0x06 goes out with its cached
+ * value); one of them changed: that register alone; neither: no transfer.
+ * Not in manual gain mode (AGC, extended mode): the ordinary path, which
+ * switches to manual as rtlsdr_set_tuner_gain() does. */
+int r82xx_set_gain_fast(struct r82xx_priv *priv, int gain, int *rtl_vga_control)
+{
+	int rc = 0, lna = 0, mix = 0, ch5, ch7;
+	uint8_t v[3];
+
+	if (!priv->last_manual_gain || priv->last_extended_mode)
+		return r82xx_set_gain(priv, 1, gain, 0, 0, 0, 0, rtl_vga_control);
+
+	r82xx_get_rf_gain_index(gain, &lna, &mix);
+	/* 0x05: bit 4 set = LNA manual, [3:0] LNA; 0x07: bit 4 clear = mixer manual, [3:0] mixer */
+	v[0] = (uint8_t)((r82xx_read_cache_reg(priv, 0x05) & ~0x1f) | 0x10 | (lna & 0x0f));
+	v[1] = (uint8_t)r82xx_read_cache_reg(priv, 0x06);
+	v[2] = (uint8_t)((r82xx_read_cache_reg(priv, 0x07) & ~0x1f) | (mix & 0x0f));
+	ch5 = r82xx_reg_changed(priv, 0x05, v[0]);
+	ch7 = r82xx_reg_changed(priv, 0x07, v[2]);
+	if (ch5 && ch7)
+		rc = r82xx_write_arr(priv, 0x05, v, 3);
+	else if (ch5)
+		rc = r82xx_write_arr(priv, 0x05, &v[0], 1);
+	else if (ch7)
+		rc = r82xx_write_arr(priv, 0x07, &v[2], 1);
+	if (rc < 0)
+		return rc;	/* write_arr marked what may not have gone out unsynced */
+
+	priv->last_manual_gain = 1;
+	priv->last_extended_mode = 0;
+	priv->last_LNA_value = lna;
+	priv->last_Mixer_value = mix;
+
+	/* the IF VGA as r82xx_set_gain() leaves it (only written if it differs) */
+	return r82xx_set_if_mode_reg(priv, priv->last_if_mode, rtl_vga_control, 0);
+}
+
 int r82xx_get_rf_gain(struct r82xx_priv *priv)
 {
 	int lna_gain = r82xx_get_lna_gain_from_index(priv->last_LNA_value);

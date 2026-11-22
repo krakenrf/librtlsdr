@@ -167,6 +167,7 @@ int r82xx_is_tuner_locked(struct r82xx_priv *priv);
 #define R82XX_TUNE_SPAN_AUTOTUNE	0x04
 int r82xx_finish_tune(struct r82xx_priv *priv);
 int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain, int extended_mode, int lna_gain, int mixer_gain, int vga_gain, int *rtl_vga_control);
+int r82xx_set_gain_fast(struct r82xx_priv *priv, int gain, int *rtl_vga_control);
 int r82xx_get_rf_gain(struct r82xx_priv *priv);
 int r82xx_get_if_gain(struct r82xx_priv *priv);
 

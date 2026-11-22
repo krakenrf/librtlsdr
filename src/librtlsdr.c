@@ -1874,6 +1874,78 @@ int rtlsdr_finish_tune(rtlsdr_dev_t *dev)
 	return r;
 }
 
+/* the R820T / R828D fast gain write, cs_mutex held and the repeater on */
+static int rtlsdr_r82xx_gain_fast(rtlsdr_dev_t *dev, int gain)
+{
+	int rtl_vga_control = 0;
+	int rc = r82xx_set_gain_fast(&dev->r82xx_p, gain, &rtl_vga_control);
+
+	return rtlsdr_vga_control(dev, rc, rtl_vga_control);
+}
+
+int rtlsdr_set_tuner_gain_fast(rtlsdr_dev_t *dev, int gain, int flags)
+{
+	int r;
+
+	#ifdef _ENABLE_RPC
+	if (rtlsdr_rpc_is_enabled())
+	{
+	  return rtlsdr_rpc_set_tuner_gain(dev, gain);
+	}
+	#endif
+	if (!dev || !dev->tuner)
+		return -1;
+	if (!rtlsdr_fast_tune_applies(dev))
+		return rtlsdr_set_tuner_gain(dev, gain);
+
+	pthread_mutex_lock(&dev->cs_mutex);
+	dev->i2c_in_lazy = (flags & RTLSDR_TUNE_NO_DUMMY_READ) != 0;
+	rtlsdr_set_i2c_repeater(dev, 1);
+	r = rtlsdr_r82xx_gain_fast(dev, gain);
+	rtlsdr_set_i2c_repeater(dev, 0);
+	dev->i2c_in_lazy = 0;
+	pthread_mutex_unlock(&dev->cs_mutex);
+	return r;
+}
+
+int rtlsdr_set_center_freq_gain_fast(rtlsdr_dev_t *dev, uint32_t freq, int gain, int flags)
+{
+	int r, rg;
+
+	#ifdef _ENABLE_RPC
+	if (rtlsdr_rpc_is_enabled())
+	{
+	  r = rtlsdr_rpc_set_center_freq(dev, freq);
+	  rg = rtlsdr_rpc_set_tuner_gain(dev, gain);
+	  return r < 0 ? r : rg;
+	}
+	#endif
+	if (!dev || !dev->tuner)
+		return -1;
+	if (!rtlsdr_fast_tune_applies(dev)) {
+		r = rtlsdr_set_center_freq_fast(dev, freq, flags);
+		rg = rtlsdr_set_tuner_gain(dev, gain);
+		return r < 0 ? r : rg;
+	}
+
+	pthread_mutex_lock(&dev->cs_mutex);	/* recursive: the tune takes it again */
+	r = rtlsdr_set_center_freq_fast(dev, freq, flags);
+	/* the gain straight after the tune, in the same hold of the I2C
+	 * repeater: the tune's last transfer went to the tuner a moment ago, so
+	 * no dummy read is needed in front (a write is made only for what
+	 * changed). The repeater is switched on again only if the tune's I2C
+	 * failed (rtlsdr_i2c_read / _write cleared i2c_repeater_on). */
+	if (dev->i2c_repeater_on) {
+		rg = rtlsdr_r82xx_gain_fast(dev, gain);
+	} else {
+		rtlsdr_set_i2c_repeater(dev, 1);
+		rg = rtlsdr_r82xx_gain_fast(dev, gain);
+		rtlsdr_set_i2c_repeater(dev, 0);
+	}
+	pthread_mutex_unlock(&dev->cs_mutex);
+	return r < 0 ? r : rg;
+}
+
 int rtlsdr_is_tuner_PLL_locked(rtlsdr_dev_t *dev)
 {
 	int r = -1;

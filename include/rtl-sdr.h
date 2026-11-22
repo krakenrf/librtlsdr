@@ -234,6 +234,45 @@ RTLSDR_API int rtlsdr_set_center_freq_fast(rtlsdr_dev_t *dev, uint32_t freq, int
  */
 RTLSDR_API int rtlsdr_finish_tune(rtlsdr_dev_t *dev);
 
+/*!
+ * A manual tuner gain in fewer USB transfers, for a gain written with nearly
+ * every retune (a sweep's per-hop gain). The same gain as
+ * rtlsdr_set_tuner_gain(dev, gain) - the same table and rounding, the same
+ * register cache, so any later call behaves as after the ordinary one - but
+ * without its unused read of tuner registers 0..3, and with the LNA and the
+ * mixer gain in one I2C write when both change; nothing is written when the
+ * tuner already has that gain. The IF VGA (rtlsdr_set_tuner_if_mode) is left
+ * as it is, as rtlsdr_set_tuner_gain() leaves it. Not in manual gain mode
+ * (tuner AGC), and with any tuner other than the R820T / R828D or in direct
+ * sampling: rtlsdr_set_tuner_gain() itself.
+ * flags: RTLSDR_TUNE_NO_DUMMY_READ as for rtlsdr_set_center_freq_fast() (a
+ * write comes first here, so the dummy read is still made: the flag changes
+ * nothing for this call alone). Reads no 3 mod 4 bytes: drops no samples.
+ *
+ * \param dev the device handle given by rtlsdr_open()
+ * \param gain in tenths of a dB, as rtlsdr_set_tuner_gain()
+ * \param flags RTLSDR_TUNE_NO_DUMMY_READ or 0
+ * \return 0 on success, < 0 on an I/O error (the registers not written are
+ *         marked so that the next gain call writes them)
+ */
+RTLSDR_API int rtlsdr_set_tuner_gain_fast(rtlsdr_dev_t *dev, int gain, int flags);
+
+/*!
+ * rtlsdr_set_center_freq_fast(dev, freq, flags), then the gain as
+ * rtlsdr_set_tuner_gain_fast(dev, gain) in the same hold of the I2C
+ * repeater: the tune's own transfers come first, so no dummy read is needed
+ * before the gain write - 1 USB transfer more than the tune when the gain
+ * changes (LNA and mixer in one write), none when it doesn't. The gain is
+ * written even when the tune fails. Other tuners / direct sampling: the
+ * fast tune, then rtlsdr_set_tuner_gain().
+ *
+ * \return the tune's result if it failed (< 0), else the gain's
+ */
+RTLSDR_API int rtlsdr_set_center_freq_gain_fast(rtlsdr_dev_t *dev, uint32_t freq, int gain, int flags);
+
+/* rtlsdr_set_tuner_gain_fast() and rtlsdr_set_center_freq_gain_fast() exist */
+#define RTLSDR_HAS_GAIN_FAST 1
+
 /*
  * Defined when no tune drops samples from a running stream
  * (rtlsdr_read_async / rtlsdr_read_sync), so dongles streaming together stay
