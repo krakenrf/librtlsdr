@@ -2050,7 +2050,17 @@ static const struct IFinfo IFi[] = {
 
 	{ 3, 1950+3,      1500,  30, 0x0F, 0x8F, 0x60 },
 
-	{ 3, 2200+0,      1600,   0, 0x0F, 0x8F, 0x00 },
+	/* IF centre 1.815 MHz (was 1.6, RTLSDR_R82XX_IF_1815): at 1.6 MHz a 2.4 MS/s
+	 * stream (IF 0.4-2.8 MHz; the spectrum is inverted, baseband +f at IF - f)
+	 * reached below the high-pass corner (-3 dB at IF 0.47-0.51 MHz, chip to
+	 * chip), so the top ~100 kHz of the band fell off steeply, after a +1-1.6 dB
+	 * peak, with the channels' levels 2-2.5 dB apart and their phases 5-10 deg
+	 * apart there. At 1.815 MHz (stock osmocom's IF centre) the stream is
+	 * IF 0.615-3.015 MHz: both band edges roll off alike (the RTL2832U's
+	 * decimation filter), the low-pass (FILT_CODE 0, corner > 3.7 MHz) still
+	 * clear. Measured on KrakenSDRs (heimdall_v2/docs/dev, librtlsdr-fork.md in
+	 * krakensdr_suite). */
+	{ 3, 2200+0,      1815,   0, 0x0F, 0x8F, 0x00 },
 	{ 3, 3000+0,      2000,   0, 0x04, 0x8F, 0x00 },
 	{ 3, 5000+0,      3570,   0, 0x0B, 0x6B, 0x00 }
 

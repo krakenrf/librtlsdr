@@ -297,6 +297,14 @@ RTLSDR_API int rtlsdr_set_center_freq_gain_fast(rtlsdr_dev_t *dev, uint32_t freq
  */
 #define RTLSDR_NO_STREAM_SLIP 1
 
+/*
+ * Defined when an R820T / R828D tuner streams with its IF centre at
+ * 1.815 MHz for sample rates of about 2.08-2.6 MS/s (the 2.2 MHz filter row;
+ * was 1.6 MHz): the band then clears the tuner's IF high-pass, so both band
+ * edges roll off alike and the dongles match there in level and phase.
+ */
+#define RTLSDR_R82XX_IF_1815 1
+
 /*!
  * Set harmonic reception - for R820T/2 tuner
  *
